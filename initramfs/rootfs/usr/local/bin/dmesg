@@ -1,0 +1,18 @@
+#!/bin/sh
+# Wrapper around busybox dmesg that adds -t (strip timestamps).  Needed by
+# blktests nvme/039 and any test that parses dmesg without leading "[...]".
+
+strip_ts=0
+args=""
+for a in "$@"; do
+    case "$a" in
+        -t) strip_ts=1 ;;
+        *)  args="$args $a" ;;
+    esac
+done
+
+if [ "$strip_ts" -eq 1 ]; then
+    busybox dmesg $args | sed -E 's/^\[ *[0-9]+\.[0-9]+\] //'
+else
+    exec busybox dmesg $args
+fi

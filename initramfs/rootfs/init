@@ -40,6 +40,10 @@ ndt_test=$(awk -v RS=' ' -F= '/^ndt_test=/{print $2}' /proc/cmdline | tr -d '\n'
 if [ -n "$ndt_test" ]; then
     echo "=== NDT_BEGIN test=$ndt_test ==="
     modprobe nvme
+    # Burn the kernel's one-shot "capability attribute has been deprecated"
+    # warning here so it doesn't land mid-test (nvme/039 last_dmesg | tail -2
+    # would otherwise lose a real error line to this noise).
+    cat /sys/block/*/capability > /dev/null 2>&1 || true
     cd /opt/blktests
     ./check "$ndt_test"
     # Result file lives at results/<dev_name>/<test_name>, e.g. results/nvme0n2/nvme/032.
