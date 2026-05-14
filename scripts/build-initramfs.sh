@@ -48,6 +48,10 @@ for f in modules.order modules.builtin modules.builtin.modinfo; do
 done
 depmod -b "$ROOTFS" "$KVER"
 
+# blktests' _have_kernel_options runs zgrep on /proc/config.gz (exposed by
+# CONFIG_IKCONFIG_PROC) — ship the wrapper so it can do that.
+install -D -m 755 /usr/bin/zgrep "$ROOTFS/usr/bin/zgrep"
+
 # 2. nvme-cli binary + libnvme
 echo "[build-initramfs] stage nvme-cli"
 install -D -m 755 "$NVMECLI/nvme" "$ROOTFS/usr/local/bin/nvme"

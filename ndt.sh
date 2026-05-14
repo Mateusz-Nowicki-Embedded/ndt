@@ -75,15 +75,15 @@ if ! status_line=$(grep -m 1 '=== NDT_STATUS ' "$CONSOLE"); then
     exit 1
 fi
 
-# Line looks like: "=== NDT_STATUS status=pass reason= ==="
-status=$(sed -nE 's/.*status=([a-z]+).*/\1/p' <<<"$status_line")
+# Line looks like: "=== NDT_STATUS status='pass' reason='' ==="
+status=$(sed -nE "s/.*status='([^']*)'.*/\1/p" <<<"$status_line")
 
 case "$status" in
     pass)
         echo "[ndt] PASS: $TEST_ID"
         exit 0
         ;;
-    fail|notrun|*)
+    *)
         echo "[ndt] FAIL: $TEST_ID ($status_line)"
         # Dump dmesg fragment between sentinel markers for quick triage.
         if grep -q 'NDT_DMESG_BEGIN' "$CONSOLE"; then
