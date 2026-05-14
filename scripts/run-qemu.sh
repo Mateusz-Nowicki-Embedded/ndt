@@ -36,7 +36,7 @@ INITRAMFS=${INITRAMFS:-"$NDT/initramfs/initramfs.cpio.gz"}
 for f in "$BZIMAGE" "$INITRAMFS"; do
     if [[ ! -f "$f" ]]; then
         echo "[run-qemu.sh] missing artifact: $f" >&2
-        echo "[run-qemu.sh] hint: run ndt/scripts/build-all.sh first" >&2
+        echo "[run-qemu.sh] hint: run ndt/build-all.sh first" >&2
         exit 1
     fi
 done

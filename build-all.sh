@@ -11,11 +11,11 @@
 # the freshly built binaries into initramfs/initramfs.cpio.gz.
 
 set -euo pipefail
-HERE=$(cd "$(dirname "$0")" && pwd)
+NDT=$(cd "$(dirname "$0")" && pwd)
 
 # TODO: implement individual build scripts and wire them up here.
-"$HERE/build-kernel.sh"
-"$HERE/build-qemu.sh"
-"$HERE/build-blktests.sh"
-"$HERE/build-nvme-cli.sh"
-"$HERE/build-initramfs.sh"
+"$NDT/scripts/build-kernel.sh"
+"$NDT/scripts/build-qemu.sh"
+"$NDT/scripts/build-blktests.sh"
+"$NDT/scripts/build-nvme-cli.sh"
+"$NDT/scripts/build-initramfs.sh"

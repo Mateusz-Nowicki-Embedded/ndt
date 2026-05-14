@@ -18,11 +18,12 @@ exercise and validate the kernel's NVMe driver.
 - `initramfs/` — guest root filesystem source (`rootfs/`) and the
   prebuilt `initramfs.cpio.gz` shipped in git.  Contents are stable
   across most runs and do not need to be rebuilt for every test.
+- `build-all.sh` — top-level wrapper that rebuilds kernel, QEMU,
+  blktests, nvme-cli, and finally the initramfs image.
 - `scripts/`
-  - `build-all.sh` — wrapper that rebuilds kernel, QEMU, blktests,
-    nvme-cli, and finally the initramfs image.
   - `build-kernel.sh`, `build-qemu.sh`, `build-blktests.sh`,
-    `build-nvme-cli.sh`, `build-initramfs.sh` — per-component builds.
+    `build-nvme-cli.sh`, `build-initramfs.sh` — per-component builds
+    invoked by `build-all.sh`.
   - `run-qemu.sh` — boots the locally built kernel + initramfs in QEMU.
   - `refresh-nvme-mod.sh` — narrow loop: rebuild just the NVMe modules
     and repack the cpio.
