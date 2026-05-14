@@ -52,10 +52,6 @@ depmod -b "$ROOTFS" "$KVER"
 # CONFIG_IKCONFIG_PROC) — ship the wrapper so it can do that.
 install -D -m 755 /usr/bin/zgrep "$ROOTFS/usr/bin/zgrep"
 
-# /boot/config-* is no longer staged (we rely on /proc/config.gz); wipe any
-# leftover from older builds so it doesn't confuse zgrep.
-rm -rf "$ROOTFS/boot"
-
 # 2. nvme-cli binary + libnvme
 echo "[build-initramfs] stage nvme-cli"
 install -D -m 755 "$NVMECLI/nvme" "$ROOTFS/usr/local/bin/nvme"
