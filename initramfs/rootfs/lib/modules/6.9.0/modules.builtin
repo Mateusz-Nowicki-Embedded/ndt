@@ -5,6 +5,7 @@ kernel/arch/x86/events/intel/intel-cstate.ko
 kernel/arch/x86/kernel/msr.ko
 kernel/arch/x86/kernel/cpuid.ko
 kernel/arch/x86/platform/intel/iosf_mbi.ko
+kernel/kernel/configs.ko
 kernel/fs/binfmt_misc.ko
 kernel/fs/binfmt_script.ko
 kernel/fs/mbcache.ko
