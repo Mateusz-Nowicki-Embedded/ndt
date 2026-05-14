@@ -133,7 +133,17 @@ for ((it=1; it<=iter; it++)); do
             fail=$((fail + 1))
             echo "FAIL  ($LAST_STATUS_LINE)"
             echo "       log: $log"
-            if grep -q 'NDT_DMESG_BEGIN' "$log" 2>/dev/null; then
+            # blktests stdout between markers, with kernel timestamps filtered
+            # out — this is what shows skip reasons and .out diffs.
+            sed -n '/=== NDT_BEGIN/,/=== NDT_STATUS/p' "$log" \
+                | sed -e '1d;$d' \
+                | grep -v '^\[[ ]*[0-9]\+\.[0-9]\+\]' \
+                | tail -20 \
+                | sed 's/^/         | /'
+            # dmesg only when blktests itself flagged it (reason=dmesg).
+            if grep -q "reason='dmesg'" <<<"$LAST_STATUS_LINE" \
+               && grep -q 'NDT_DMESG_BEGIN' "$log" 2>/dev/null; then
+                echo "       dmesg:"
                 sed -n '/NDT_DMESG_BEGIN/,/NDT_DMESG_END/p' "$log" \
                     | sed -e '1d;$d' | tail -20 | sed 's/^/         | /'
             fi
