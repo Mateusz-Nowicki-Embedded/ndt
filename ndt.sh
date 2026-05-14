@@ -2,11 +2,15 @@
 # NVMe Driver Tester — run blktests cases under QEMU and report PASS/FAIL.
 #
 # Usage:
-#   ./ndt.sh 32                    # single test
-#   ./ndt.sh nvme/032              # full id form
-#   ./ndt.sh t=32,50               # multiple tests in one iteration
-#   ./ndt.sh t=32,50 i=4           # 32 then 50, repeated 4 iterations (8 runs)
-#   ./ndt.sh 32 50 i=2             # positional + named, equivalent to t=32,50 i=2
+#   ./ndt.sh 32                       # single test
+#   ./ndt.sh nvme/032                 # full id form
+#   ./ndt.sh t=32,50                  # multiple tests in one iteration
+#   ./ndt.sh t=32,50 i=4              # 32 then 50, repeated 4 iterations (8 runs)
+#   ./ndt.sh 32 50 i=2                # positional + named, equivalent to t=32,50 i=2
+#   ./ndt.sh t=32,50 i=4 --stop-at-fail   # abort the whole run on the first FAIL
+#
+# By default a FAIL does NOT abort the remaining runs — the loop continues so
+# you can see flake rates over multiple iterations.  --stop-at-fail flips that.
 #
 # Exit codes:
 #   0   all runs passed
@@ -28,12 +32,14 @@ usage() {
 
 tests=()
 iter=1
+stop_at_fail=0
 
 for arg in "$@"; do
     case "$arg" in
+        --stop-at-fail) stop_at_fail=1 ;;
         i=*) iter="${arg#i=}" ;;
         t=*) IFS=',' read -ra _add <<< "${arg#t=}"; tests+=("${_add[@]}") ;;
-        *=*) echo "[ndt] unknown arg: $arg" >&2; usage ;;
+        --*|*=*) echo "[ndt] unknown arg: $arg" >&2; usage ;;
         *)   tests+=("$arg") ;;
     esac
 done
@@ -126,6 +132,10 @@ for ((it=1; it<=iter; it++)); do
             if grep -q 'NDT_DMESG_BEGIN' "$log" 2>/dev/null; then
                 sed -n '/NDT_DMESG_BEGIN/,/NDT_DMESG_END/p' "$log" \
                     | sed -e '1d;$d' | tail -20 | sed 's/^/         | /'
+            fi
+            if (( stop_at_fail )); then
+                echo "[ndt] --stop-at-fail set, aborting remaining runs"
+                break 2
             fi
         fi
     done
