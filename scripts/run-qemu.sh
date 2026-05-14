@@ -32,6 +32,7 @@ fi
 
 BZIMAGE=${BZIMAGE:-"$NDT/build/linux/arch/x86/boot/bzImage"}
 INITRAMFS=${INITRAMFS:-"$NDT/initramfs/initramfs.cpio.gz"}
+APPEND=${APPEND:-"console=ttyS0 panic=-1"}
 
 for f in "$BZIMAGE" "$INITRAMFS"; do
     if [[ ! -f "$f" ]]; then
@@ -66,7 +67,7 @@ exec "$QEMU_BIN" \
     -machine q35 \
     -kernel "$BZIMAGE" \
     -initrd "$INITRAMFS" \
-    -append "console=ttyS0 panic=-1" \
+    -append "$APPEND" \
     -nographic \
     -m 1G \
     -smp 8 \
