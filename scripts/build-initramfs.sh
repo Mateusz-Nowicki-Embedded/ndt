@@ -65,8 +65,12 @@ echo "[build-initramfs] stage blktests"
 rm -rf "$ROOTFS/opt/blktests"
 mkdir -p "$ROOTFS/opt"
 rsync -a --exclude='.git*' "$BLKTESTS/" "$ROOTFS/opt/blktests/"
-# Default test device: second NVMe namespace (1 GiB, destructively testable).
-echo 'TEST_DEVS=(/dev/nvme0n2)' > "$ROOTFS/opt/blktests/config"
+cat > "$ROOTFS/opt/blktests/config" <<'EOF'
+# Second NVMe namespace (1 GiB, destructively testable).
+TEST_DEVS=(/dev/nvme0n2)
+# Unprivileged user used by tests like nvme/046; see initramfs/rootfs/etc/passwd.
+NORMAL_USER=nobody
+EOF
 
 # 4. Repack
 echo "[build-initramfs] pack cpio.gz"
