@@ -23,9 +23,12 @@ set -euo pipefail
 
 NDT=$(cd "$(dirname "$0")" && pwd)
 
+# Print the leading comment block (everything from line 2 down to the first
+# non-comment line) on the requested stream, then exit with the given code.
 usage() {
-    sed -n '2,15p' "$0" >&2
-    exit 2
+    local rc=${1:-2} dest=${2:-2}
+    awk 'NR==1{next} /^#/{sub(/^#[ \t]?/,""); print; next} {exit}' "$0" >&"$dest"
+    exit "$rc"
 }
 
 [[ $# -lt 1 ]] && usage
@@ -36,6 +39,7 @@ stop_at_fail=0
 
 for arg in "$@"; do
     case "$arg" in
+        -h|--help) usage 0 1 ;;
         --stop-at-fail) stop_at_fail=1 ;;
         i=*) iter="${arg#i=}" ;;
         t=*) IFS=',' read -ra _add <<< "${arg#t=}"; tests+=("${_add[@]}") ;;
