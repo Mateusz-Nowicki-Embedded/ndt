@@ -57,9 +57,12 @@ if [ -n "$ndt_test" ]; then
         result_reason=$(sed -n 's/^reason\t//p' "$result_file" | head -1)
     fi
     echo "=== NDT_STATUS status='${result_status:-unknown}' reason='${result_reason:-}' ==="
-    echo "=== NDT_DMESG_BEGIN ==="
-    dmesg
-    echo "=== NDT_DMESG_END ==="
+    # dmesg only on non-pass: spares serial bandwidth and host console log.
+    if [ "$result_status" != "pass" ]; then
+        echo "=== NDT_DMESG_BEGIN ==="
+        dmesg
+        echo "=== NDT_DMESG_END ==="
+    fi
     echo "=== NDT_END ==="
     poweroff -f
 fi
