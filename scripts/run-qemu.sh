@@ -45,19 +45,24 @@ done
 NVME=${NVME:-1}
 NVME_NS1="$NDT/disks/nvme-ns1.img"
 NVME_NS2="$NDT/disks/nvme-ns2.img"
+NVME_NS3="$NDT/disks/nvme-ns3.img"
 
 nvme_args=()
 if [[ "$NVME" == "1" ]]; then
     # Plug NVMe behind a pcie-root-port so SBR-based hot reset and FLR work
     # end-to-end (the root port is the upstream bridge that emulates Hot Reset
     # on Secondary Bus Reset).
+    # nsid=3 is formatted with 8-byte metadata (mset=0, separate buffer) for
+    # nvme/064 and related metadata tests.
     nvme_args+=(
         -device "pcie-root-port,id=rp0,chassis=1,slot=1,bus=pcie.0"
         -drive "file=$NVME_NS1,format=raw,if=none,id=nvm0"
         -drive "file=$NVME_NS2,format=raw,if=none,id=nvm1"
+        -drive "file=$NVME_NS3,format=raw,if=none,id=nvm2"
         -device "nvme,id=nvme0,bus=rp0,serial=NVME0001,max_ioqpairs=8,cmb_size_mb=16"
         -device "nvme-ns,drive=nvm0,bus=nvme0,nsid=1"
         -device "nvme-ns,drive=nvm1,bus=nvme0,nsid=2"
+        -device "nvme-ns,drive=nvm2,bus=nvme0,nsid=3,ms=8,mset=0"
     )
 fi
 

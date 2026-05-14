@@ -66,8 +66,9 @@ rm -rf "$ROOTFS/opt/blktests"
 mkdir -p "$ROOTFS/opt"
 rsync -a --exclude='.git*' "$BLKTESTS/" "$ROOTFS/opt/blktests/"
 cat > "$ROOTFS/opt/blktests/config" <<'EOF'
-# Second NVMe namespace (1 GiB, destructively testable).
-TEST_DEVS=(/dev/nvme0n2)
+# nvme0n2: 256 MiB, no metadata (default test target for most tests).
+# nvme0n3: 256 MiB, ms=8 mset=0 (metadata-formatted, exercises nvme/064).
+TEST_DEVS=(/dev/nvme0n2 /dev/nvme0n3)
 # Unprivileged user used by tests like nvme/046; see initramfs/rootfs/etc/passwd.
 NORMAL_USER=nobody
 EOF
