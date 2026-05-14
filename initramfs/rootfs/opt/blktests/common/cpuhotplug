@@ -1,0 +1,43 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+#
+# CPU hotplug helper functions.
+
+. common/shellcheck
+
+# Also initializes the ALL_CPUS and HOTPLUGGABLE_CPUS arrays.
+_have_cpu_hotplug() {
+	ALL_CPUS=()
+	HOTPLUGGABLE_CPUS=()
+	CPUS_ONLINE_SAVED=()
+
+	local cpu_dir cpu
+	for cpu_dir in /sys/devices/system/cpu/cpu+([0-9]); do
+		cpu="${cpu_dir#/sys/devices/system/cpu/cpu}"
+		ALL_CPUS+=("$cpu")
+		if [[ -w ${cpu_dir}/online ]]; then
+			HOTPLUGGABLE_CPUS+=("$cpu")
+			# shellcheck disable=SC2034
+			CPUS_ONLINE_SAVED["$cpu"]="$(cat "${cpu_dir}/online")"
+		fi
+	done
+
+	if [[ ${#ALL_CPUS[@]} -eq 1 || ${#HOTPLUGGABLE_CPUS[@]} -eq 0 ]]; then
+		SKIP_REASONS+=("CPU hotplugging is not supported")
+		return 1
+	fi
+	return 0
+}
+
+_online_cpu() {
+	# shellcheck disable=SC2034
+	RESTORE_CPUS_ONLINE=1
+	echo 1 > "/sys/devices/system/cpu/cpu$1/online"
+}
+
+_offline_cpu() {
+	# shellcheck disable=SC2034
+	RESTORE_CPUS_ONLINE=1
+	echo 0 > "/sys/devices/system/cpu/cpu$1/online"
+}

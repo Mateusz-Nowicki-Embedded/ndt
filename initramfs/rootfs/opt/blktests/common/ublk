@@ -1,0 +1,51 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2023 Ming Lei
+#
+# ublk_drv helper functions.
+
+. common/shellcheck
+
+if which rublk > /dev/null 2>&1; then
+	export UBLK_PROG="src/rublk_wrapper.sh"
+else
+	export UBLK_PROG="src/miniublk"
+fi
+
+_have_ublk() {
+	_have_driver ublk_drv
+	_have_program "${UBLK_PROG}"
+}
+
+_remove_ublk_devices() {
+	${UBLK_PROG} del -a
+}
+
+_get_ublk_dev_state() {
+	${UBLK_PROG} list -n "$1" | grep "state" | awk '{print $11}'
+}
+
+_get_ublk_daemon_pid() {
+	${UBLK_PROG} list -n "$1" | grep "pid" | awk '{print $7}'
+}
+
+_init_ublk() {
+	_io_uring_enable
+
+	_remove_ublk_devices > /dev/null 2>&1
+
+	modprobe -rq ublk_drv
+	if _module_file_exists ublk_drv && ! modprobe ublk_drv; then
+		return 1
+	fi
+
+	udevadm settle
+	return 0
+}
+
+_exit_ublk() {
+	_remove_ublk_devices
+	udevadm settle
+	modprobe -r -q ublk_drv
+	_io_uring_restore
+}

@@ -1,0 +1,139 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+#
+# fio helper functions.
+
+. common/shellcheck
+
+_have_xfs_io_atomic_write() {
+	local s
+
+	_have_program xfs_io || return $?
+
+	# Determine if the statx command returns the atomic writes fields.
+	s=$(xfs_io -c "statx -r -m 0x00010000" /dev/null | grep atomic_write_unit_min)
+	if [[ $s == "" ]];
+	then
+		SKIP_REASONS+=("xfs_io does not support the statx atomic write fields")
+		return 1
+	fi
+
+	# If the pwrite command supports the -A option then this version
+	# of xfs_io supports atomic writes.
+	s=$(xfs_io -c help | grep pwrite | awk '{ print $4}')
+	if [[ $s == *"A"* ]];
+	then
+		return 0
+	fi
+	SKIP_REASONS+=("xfs_io does not support the -A option")
+	return 1
+}
+
+_have_xfs() {
+	_have_fs xfs && _have_program mkfs.xfs
+}
+
+_test_dev_suits_xfs() {
+	local logical_block_size
+
+	logical_block_size=$(_test_dev_queue_get logical_block_size)
+	if ((logical_block_size > 32768 )); then
+		SKIP_REASONS+=("sector size ${logical_block_size} is larger than max XFS sector size 32768")
+		return 1
+	fi
+	return 0
+}
+
+_xfs_mkfs_and_mount() {
+	local bdev=$1
+	local mount_dir=$2
+	local bs
+	local xfs_logsize="64m"
+
+	bs=$(_min_io "$bdev")
+
+	if [[ $bs -gt 4096 ]]; then
+		xfs_logsize="128m"
+	fi
+
+	mkdir -p "${mount_dir}"
+	umount --quiet "${mount_dir}"
+	mkfs.xfs -l size=$xfs_logsize -f "${bdev}" -b size="$bs" || return $?
+	mount "${bdev}" "${mount_dir}"
+}
+
+_xfs_run_fio_verify_io() {
+	local mount_dir="/mnt/blktests"
+	local bdev=$1
+	local sz=$2
+	local sz_mb
+	local avail
+	local avail_mb
+	local rc
+
+	_xfs_mkfs_and_mount "${bdev}" "${mount_dir}" \
+		>>"${FULL}" 2>&1 || return $?
+
+	avail="$(df --output=avail "${mount_dir}" | tail -1)"
+	avail_mb="$((avail / 1024))"
+
+	if [[ -z "${sz}" ]]; then
+		sz_mb="${avail_mb}"
+	else
+		sz_mb="$(convert_to_mb "${sz}")"
+		if [[ "${sz_mb}" -gt "${avail_mb}" ]]; then
+			sz_mb="${avail_mb}"
+		fi
+	fi
+
+	_run_fio_verify_io --size="${sz_mb}m" --directory="${mount_dir}/"
+	rc=$?
+
+	umount "${mount_dir}" >> "${FULL}" 2>&1
+	rm -fr "${mount_dir}"
+
+	return "${rc}"
+}
+
+# Use xfs_io to perform a non-atomic write using pwritev2().
+# Args:    $1 - device to write to
+#          $2 - number of bytes to write
+# Returns: Number of bytes written
+run_xfs_io_pwritev2() {
+	local dev=$1
+	local bytes_to_write=$2
+	local bytes_written
+
+	# Perform write and extract out bytes written from xfs_io output
+	bytes_written=$(xfs_io -d -C \
+		"pwrite -b ${bytes_to_write} -V 1 -D 0 ${bytes_to_write}" \
+		"$dev" | grep "wrote" | sed 's/\// /g' | awk '{ print $2 }')
+	echo "$bytes_written"
+}
+
+# Use xfs_io to perform an atomic write using pwritev2().
+# Args:    $1 - device to write to
+#          $2 - number of bytes to write
+# Returns: Number of bytes written
+run_xfs_io_pwritev2_atomic() {
+	local dev=$1
+	local bytes_to_write=$2
+	local bytes_written
+
+	# Perform atomic write and extract out bytes written from xfs_io output
+	bytes_written=$(xfs_io -d -C \
+		"pwrite -b ${bytes_to_write} -V 1 -A -D 0 ${bytes_to_write}" \
+		"$dev" | grep "wrote" | sed 's/\// /g' | awk '{ print $2 }')
+	echo "$bytes_written"
+}
+
+run_xfs_io_xstat() {
+	local dev=$1
+	local field=$2
+	local statx_output
+
+	statx_output=$(xfs_io -c "statx -r -m 0x00010000" "$dev" | \
+		grep "$field =" | awk '{ print $3 }')
+	echo "$statx_output"
+}

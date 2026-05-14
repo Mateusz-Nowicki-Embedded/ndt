@@ -1,0 +1,5 @@
+# Local build outputs.  Rebuild with scripts/build-all.sh.
+/build/
+
+# Per-run NVMe namespace images.
+/disks/

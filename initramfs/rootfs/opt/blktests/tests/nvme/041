@@ -1,0 +1,56 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2022 Hannes Reinecke, SUSE Labs
+#
+# Create authenticated connections
+
+. tests/nvme/rc
+
+DESCRIPTION="Create authenticated connections"
+QUICK=1
+
+requires() {
+	_nvme_requires
+	_have_loop
+	_have_kernel_options NVME_AUTH NVME_TARGET_AUTH
+	_require_kernel_nvme_fabrics_feature dhchap_ctrl_secret
+	_require_nvme_trtype_is_fabrics
+	_require_nvme_cli_auth
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	_setup_nvmet
+
+	local hostkey
+	local ctrldev
+
+	hostkey="$(nvme gen-dhchap-key -n "${def_subsysnqn}" 2> /dev/null)"
+	if [ -z "$hostkey" ] ; then
+		echo "nvme gen-dhchap-key failed"
+		return 1
+	fi
+
+	_nvmet_target_setup --blkdev file --hostkey "${hostkey}"
+
+	# Test unauthenticated connection (should fail)
+	echo "Test unauthenticated connection (should fail)"
+	_nvme_connect_subsys --no-wait --expect-failure
+
+	_nvme_disconnect_subsys
+
+	# Test authenticated connection
+	echo "Test authenticated connection"
+	_nvme_connect_subsys --dhchap-secret "${hostkey}"
+
+	_nvme_disconnect_subsys
+
+	_nvmet_target_cleanup
+
+	echo "Test complete"
+}

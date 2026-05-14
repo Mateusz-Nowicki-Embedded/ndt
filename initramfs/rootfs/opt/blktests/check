@@ -1,0 +1,1267 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+
+shopt -s extglob
+
+_warning() {
+	echo "$0: $*" >&2
+}
+
+_error() {
+	echo "$0: $*" >&2
+	exit 1
+}
+
+_check_exclusive_functions() {
+	if declare -fF "${1}" >/dev/null && declare -fF "${2}" >/dev/null; then
+		_warning "${test_name} defines both ${1} and ${2}"
+		return 1
+	fi
+}
+
+_found_test() {
+	local test_name="$1"
+	local explicit="$2"
+
+	unset CAN_BE_ZONED DESCRIPTION QUICK TIMED requires device_requires \
+	      test test_device fallback_device cleanup_fallback_device \
+	      set_conditions test_device_array
+
+	# shellcheck disable=SC1090
+	if ! . "tests/${test_name}"; then
+		return 1
+	fi
+
+	if [[ -z $DESCRIPTION ]]; then
+		_warning "${test_name} does not define DESCRIPTION"
+		return 1
+	fi
+
+	_check_exclusive_functions test test_device || return 1
+	_check_exclusive_functions test test_device_array || return 1
+	_check_exclusive_functions test_device test_device_array || return 1
+
+	if ! declare -fF test >/dev/null && \
+			! declare -fF test_device >/dev/null && \
+			! declare -fF test_device_array >/dev/null; then
+		_warning "${test_name} does not define test(), test_device() or test_device_array()"
+		return 1
+	fi
+
+	if declare -fF device_requires >/dev/null && \
+			! declare -fF test_device >/dev/null && \
+			! declare -fF test_device_array >/dev/null; then
+		_warning "${test_name} defines device_requires() but not either test_device() or test_device_array()"
+		return 1
+	fi
+
+	if declare -fF fallback_device >/dev/null && ! declare -fF cleanup_fallback_device >/dev/null; then
+		_warning "${test_name} defines fallback_device() but not cleanup_fallback_device()"
+		return 1
+	fi
+
+	if declare -fF cleanup_fallback_device >/dev/null && ! declare -fF fallback_device >/dev/null; then
+		_warning "${test_name} defines cleanup_fallback_device() but not fallback_device()"
+		return 1
+	fi
+
+	if [[ -n $CAN_BE_ZONED ]] && declare -fF test >/dev/null && declare -fF set_conditions >/dev/null; then
+		_warning "${test_name} defines both CAN_BE_ZONED and set_conditions()"
+		return 1
+	fi
+
+	if (( QUICK && TIMED )); then
+		_warning "${test_name} cannot be both QUICK and TIMED"
+		return 1
+	fi
+
+	if (( ! explicit )); then
+		if [[ $DEVICE_ONLY -ne 0 ]] && \
+			   ! declare -fF test_device >/dev/null && \
+			   ! declare -fF test_device_array >/dev/null; then
+			return
+		fi
+		if (( QUICK_RUN && !QUICK && !TIMED )); then
+			return
+		fi
+		if [[ -n ${EXCLUDE["$test_name"]} ]]; then
+			return
+		fi
+	fi
+
+	printf '%s\0' "$test_name"
+}
+
+_found_group() {
+	local group="$1"
+	local explicit="$2"
+
+	local test_path
+
+	if (( ! explicit )); then
+		if [[ -n ${EXCLUDE["$group"]} ]]; then
+			return
+		fi
+	fi
+
+	while IFS= read -r -d '' test_path; do
+		_found_test "${test_path#tests/}" 0
+	done < <(find "tests/$group" -type f -name '[0-9][0-9][0-9]' -print0)
+}
+
+_find_tests() {
+	if [[ $# -eq 0 ]]; then
+		# No filters given, run all tests except for the meta group.
+		local group_path
+		while IFS= read -r -d '' group_path; do
+			if [[ $group_path != tests/meta ]]; then
+				_found_group "${group_path#tests/}" 0
+			fi
+		done < <(find tests -mindepth 2 -type f -name rc -printf '%h\0')
+	else
+		local filter
+		for filter in "$@"; do
+			# A filter is bad if it:
+			#     - Is an absolute path
+			#     - Is a relative path containing ".."
+			if [[ $filter =~ ^/|(^|/)\.\.(/|$) ]]; then
+				_warning "bad filter ${filter}"
+				continue
+			fi
+			# Remove leading and internal "." components.
+			filter="${filter##+(./)}"
+			filter="${filter//\/+(.\/)/\/}"
+			# Remove repeated "/".
+			filter="${filter//\/+(\/)/\/}"
+			# Remove leading "tests/"
+			filter="${filter#tests/}"
+
+			if [[ -d tests/$filter ]]; then
+				_found_group "$filter" 1
+			elif [[ -f tests/$filter ]]; then
+				_found_test "$filter" 1
+			else
+				_warning "no group or test named ${filter}"
+			fi
+		done
+	fi
+}
+
+# Return the dmesg log since the start of this test.
+_dmesg_since_test_start()
+{
+	dmesg | grep -A 9999 "$dmesg_marker"
+}
+
+_check_dmesg() {
+	local dmesg_marker="$1"
+	local seqres="${RESULTS_DIR}/${TEST_NAME}"
+
+	if [[ $CHECK_DMESG -eq 0 ]]; then
+		return 0
+	fi
+
+	_dmesg_since_test_start | bash -c "$DMESG_FILTER" >"${seqres}.dmesg"
+	grep -q -e "kernel BUG at" \
+	     -e "WARNING:" \
+	     -e "BUG:" \
+	     -e "Oops:" \
+	     -e "possible recursive locking detected" \
+	     -e "Internal error" \
+	     -e "INFO: suspicious RCU usage" \
+	     -e "INFO: possible circular locking dependency detected" \
+	     -e "general protection fault:" \
+	     -e "blktests failure" \
+	     "${seqres}.dmesg"
+	# shellcheck disable=SC2181
+	if [[ $? -eq 0 ]]; then
+		return 1
+	else
+		rm -f "${seqres}.dmesg"
+		return 0
+	fi
+}
+
+# Retrieve the value of kernel option $1.
+_get_kernel_option() {
+	local f opt=$1 result
+
+	for f in /proc/config.gz /boot/config-$(uname -r); do
+		[ -e "$f" ] || continue
+		if result=$(zgrep "^CONFIG_${opt}=" "$f"); then
+			echo "${result#*=}"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+# Check if kernel option $1 is defined.
+_check_kernel_option() {
+	case "$(_get_kernel_option "$1")" in
+		y|m)
+			return 0;;
+	esac
+
+	return 1
+}
+
+declare KMEMLEAK=0
+declare KMEMLEAK_FILE=/sys/kernel/debug/kmemleak
+
+if _check_kernel_option DEBUG_KMEMLEAK && [[ -e $KMEMLEAK_FILE && -r $KMEMLEAK_FILE ]]; then
+	if _check_kernel_option DEBUG_KMEMLEAK_DEFAULT_OFF; then
+		if grep --quiet kmemleak=on /proc/cmdline; then
+			KMEMLEAK=1
+		fi
+	else
+		KMEMLEAK=1
+	fi
+fi
+
+_setup_kmemleak() {
+	if ((KMEMLEAK)) ;then
+		echo clear > "$KMEMLEAK_FILE"
+	fi
+}
+
+_check_kmemleak() {
+	local kmemleak
+	local out=$1
+
+	((KMEMLEAK)) || return 0
+
+	{ echo scan > "$KMEMLEAK_FILE"; } 2>/dev/null || return 0
+	sleep 1
+	kmemleak=$(cat "$KMEMLEAK_FILE")
+
+	if [[ -z $kmemleak ]]; then
+		return 0
+	fi
+
+	printf '%s\n' "$kmemleak" > "$out"
+	return 1
+}
+
+_read_last_test_run() {
+	local seqres="${RESULTS_DIR}/${TEST_NAME}"
+
+	if [[ ! -e $seqres ]]; then
+		return
+	fi
+
+	local key value
+	while IFS=$'\t' read -r key value; do
+		if [[ ! $key =~ ^description|date|status|reason|exit_status$ ]]; then
+			LAST_TEST_RUN["$key"]="$value"
+		fi
+	done <"$seqres"
+}
+
+_write_test_run() {
+	local key value
+	for key in "${!TEST_RUN[@]}"; do
+		value="${TEST_RUN["$key"]}"
+		printf '%s\t%s\n' "$key" "$value" >>"$seqres"
+	done
+}
+
+_output_status() {
+	local test="$1"
+	local status="$2"
+	local str="${test} "
+
+	[[ ${COND_DESC:-} ]] && str="$str(${COND_DESC}) "
+	[[ ${DESCRIPTION:-} ]] && str="$str(${DESCRIPTION})"
+	printf '%-60s' "${str}"
+	if [[ -z $status ]]; then
+		echo
+		return
+	fi
+
+	echo -n " ["
+	if [[ -t 1 ]]; then
+		case "$status" in
+		passed)
+			tput setaf 2
+			;;
+		failed)
+			tput setaf 1
+			;;
+		"not run")
+			tput setaf 3
+			;;
+		esac
+	fi
+	echo -n "$status"
+	if [[ -t 1 ]]; then
+		tput sgr0
+	fi
+	echo "]"
+}
+
+_output_skip_reasons()
+{
+	for reason in "${SKIP_REASONS[@]}"; do
+		echo "    $reason"
+	done
+}
+
+_output_notrun() {
+	_output_status "$1" "not run"
+	_output_skip_reasons
+}
+
+_output_test_name() {
+	local dev
+	local -a devs
+	local status="$1"
+
+	if [[ "${TEST_DEV:-}" ]]; then
+		_output_status "$TEST_NAME => $(basename "$TEST_DEV")" "$status"
+	elif [[ "${TEST_DEV_ARRAY:-}" ]]; then
+		for dev in "${TEST_DEV_ARRAY[@]}"; do
+			devs+=("${dev##*/}")
+		done
+		_output_status "$TEST_NAME => ${devs[*]}" "$status"
+	else
+		_output_status "$TEST_NAME" "$status"
+	fi
+}
+
+_output_last_test_run() {
+	_output_test_name ""
+
+	{
+	local key
+	for key in "${!LAST_TEST_RUN[@]}"; do
+		printf '    %s\t%s\t...\n' "$key" "${LAST_TEST_RUN["$key"]}"
+	done
+	} | sort -t $'\t' -k 1,1 | column -t -s $'\t'
+}
+
+_output_test_run() {
+	if [[ -t 1 ]]; then
+		# Move the cursor back up to the status.
+		tput cuu $((${#LAST_TEST_RUN[@]} + 1))
+	fi
+
+	local status=${TEST_RUN["status"]}
+	if [[ $status = pass || $status = fail ]]; then
+		status+="ed"
+	fi
+	_output_test_name "$status"
+
+	{
+	local key last_value value
+	{
+	for key in "${!LAST_TEST_RUN[@]}"; do
+		last_value="${LAST_TEST_RUN["$key"]}"
+		value="${TEST_RUN["$key"]}"
+		printf '    %s\t%s\t...\t%s\n' "$key" "$last_value" "$value"
+	done
+	} | sort -t $'\t' -k 1,1
+
+	{
+	for key in "${!TEST_RUN[@]}"; do
+		if [[ $key =~ ^description|date|status|reason|exit_status$ ]]; then
+			continue
+		fi
+		# [[ -v array[key] ]] was added in Bash 4.3. Do it this ugly
+		# way to support older versions.
+		if [[ -n ${LAST_TEST_RUN["$key"]} || ${LAST_TEST_RUN["$key"]-unset} != unset ]]; then
+			continue
+		fi
+		value="${TEST_RUN["$key"]}"
+		printf '    %s\t\t...\t%s\n' "$key" "$value"
+	done
+	} | sort -t $'\t' -k 1,1
+	} | column -t -s $'\t'
+
+	if [[ $status = "not run" ]]; then
+		_output_skip_reasons
+	fi
+}
+
+_register_test_cleanup() {
+	TEST_CLEANUP=$1
+}
+
+_cleanup() {
+	if [[ -v TEST_CLEANUP ]]; then
+		${TEST_CLEANUP}
+	fi
+
+	if [[ "${TMPDIR:-}" ]]; then
+		rm -rf "$TMPDIR"
+		unset TMPDIR
+	fi
+
+	local key value
+	for key in "${!SYSFS_QUEUE_SAVED[@]}"; do
+		value="${SYSFS_QUEUE_SAVED["$key"]}"
+		echo "$value" >"${key}"
+		unset "SYSFS_QUEUE_SAVED[$key]"
+	done
+
+	if [[ "${RESTORE_CPUS_ONLINE:-}" ]]; then
+		local cpu
+		for cpu in "${!CPUS_ONLINE_SAVED[@]}"; do
+			echo "${CPUS_ONLINE_SAVED["$cpu"]}" >"/sys/devices/system/cpu/cpu$cpu/online"
+		done
+		unset RESTORE_CPUS_ONLINE
+	fi
+
+	_exit_cgroup2
+}
+
+_call_test() {
+	local test_func="$1"
+	local seqres="${RESULTS_DIR}/${TEST_NAME}"
+	# shellcheck disable=SC2034
+	FULL="${seqres}.full"
+	declare -A SYSFS_QUEUE_SAVED
+
+	declare -A LAST_TEST_RUN
+	_read_last_test_run
+	_output_last_test_run
+
+	declare -A TEST_RUN
+	TEST_RUN["date"]="$(date "+%F %T")"
+	TEST_RUN["description"]="${DESCRIPTION}"
+
+	mkdir -p "$(dirname "$seqres")"
+	# Remove leftovers from last time.
+	rm -f "${seqres}" "${seqres}."*
+
+	if [[ -v SKIP_REASONS ]]; then
+		TEST_RUN["status"]="not run"
+	else
+		_setup_kmemleak
+
+		if [[ -w /dev/kmsg ]]; then
+			local dmesg_marker="run blktests $TEST_NAME at ${TEST_RUN["date"]}"
+			echo "$dmesg_marker" >> /dev/kmsg
+		else
+			local dmesg_marker=""
+			CHECK_DMESG=0
+		fi
+		$LOGGER_PROG "run blktests $TEST_NAME"
+
+		unset TEST_CLEANUP
+		trap _cleanup EXIT
+		if ! TMPDIR="$(mktemp --tmpdir -p "$OUTPUT" -d "tmpdir.${TEST_NAME//\//.}.XXX")"; then
+			return
+		fi
+
+		TIMEFORMAT="%Rs"
+		pushd . >/dev/null || return
+		{ time "$test_func" >"${seqres}.out" 2>&1; } 2>"${seqres}.runtime"
+		TEST_RUN["exit_status"]=$?
+		popd >/dev/null || return
+		TEST_RUN["runtime"]="$(cat "${seqres}.runtime")"
+		rm -f "${seqres}.runtime"
+
+		_cleanup
+
+		if [[ -v SKIP_REASONS ]]; then
+			TEST_RUN["status"]="not run"
+		elif ! diff "tests/${TEST_NAME}.out" "${seqres}.out" >/dev/null; then
+			mv "${seqres}.out" "${seqres}.out.bad"
+			TEST_RUN["status"]=fail
+			TEST_RUN["reason"]=output
+		elif [[ ${TEST_RUN["exit_status"]} -ne 0 ]]; then
+			TEST_RUN["status"]=fail
+			TEST_RUN["reason"]="exit"
+		elif ! _check_dmesg "$dmesg_marker"; then
+			TEST_RUN["status"]=fail
+			TEST_RUN["reason"]=dmesg
+		elif ! _check_kmemleak "${seqres}.kmemleak"; then
+			TEST_RUN["status"]=fail
+			TEST_RUN["reason"]=kmemleak
+		else
+			TEST_RUN["status"]=pass
+		fi
+		rm -f "${seqres}.out"
+	fi
+
+	_write_test_run
+	_output_test_run
+
+	if [[ ${TEST_RUN["status"]} = fail ]]; then
+		case "${TEST_RUN["reason"]}" in
+		output)
+			diff -u "tests/${TEST_NAME}.out" "${seqres}.out.bad" | awk "
+			{
+				if (NR > 10) {
+					print \"    ...\"
+					print \"    (Run 'diff -u tests/${TEST_NAME}.out ${seqres}.out.bad' to see the entire diff)\"
+					exit
+				}
+				print \"    \" \$0
+			}"
+			;;
+		exit)
+			echo "    exited with status ${TEST_RUN["exit_status"]}"
+			;;
+		dmesg)
+			echo "    something found in dmesg:"
+			awk "
+			{
+				if (NR > 10) {
+					print \"    ...\"
+					print \"    (See '${seqres}.dmesg' for the entire message)\"
+					exit
+				}
+				print \"    \" \$0
+			}" "${seqres}.dmesg"
+			;;
+		kmemleak)
+			echo "    kmemleak detected:"
+			awk "
+			{
+				if (NR > 10) {
+					print \"    ...\"
+					print \"    (See '${seqres}.kmemleak' for the entire message)\"
+					exit
+				}
+				print \"    \" \$0
+			}" "${seqres}.kmemleak"
+			;;
+		esac
+		return 1
+	else
+		return 0
+	fi
+}
+
+_test_dev_is_zoned() {
+	[[ -e "${TEST_DEV_SYSFS}/queue/zoned" &&
+	   $(cat "${TEST_DEV_SYSFS}/queue/zoned") != none ]]
+}
+
+_has_modprobe_wait()
+{
+	modprobe --help |& grep --quiet -- --wait
+}
+
+# Check whether modprobe --wait is supported and set up the patient module
+# removal command. This is evaluated at source time, so we need to handle
+# the timeout dynamically in _patient_rmmod() for cases where tests want
+# to override it.
+MODPROBE_HAS_WAIT=""
+if _has_modprobe_wait; then
+	MODPROBE_HAS_WAIT="yes"
+fi
+
+if [[ -z "$MODPROBE_PATIENT_RM_TIMEOUT_SECONDS" ]]; then
+	export MODPROBE_PATIENT_RM_TIMEOUT_SECONDS="50"
+fi
+
+# checks the refcount and returns 0 if we can safely remove the module. rmmod
+# does this check for us, but we can use this to also iterate checking for this
+# refcount before we even try to remove the module. This is useful when using
+# debug test modules which take a while to quiesce.
+_patient_rmmod_check_refcnt()
+{
+	local module=$1
+	local refcnt
+
+	refcnt=$(cat "/sys/module/$module/refcnt" 2>/dev/null)
+	[[ $? -ne 0 || $refcnt -eq 0 ]]
+}
+
+# Tries to wait patiently to remove a module by ensuring first
+# the refcnt is 0 and then trying to remove the module over and over
+# again within the time allowed. The timeout is configurable per test, just set
+# MODPROBE_PATIENT_RM_TIMEOUT_SECONDS prior to calling this function.
+# This applies to both cases where kmod supports the patient module remover
+# (modprobe --wait) and where it does not.
+#
+# If your version of kmod supports modprobe --wait, we use that instead.
+# Otherwise we have to implement a patient module remover ourselves.
+_patient_rmmod()
+{
+	local module=$1
+	local max_tries_max=$MODPROBE_PATIENT_RM_TIMEOUT_SECONDS
+	local max_tries=0
+	local mod_ret=0
+	local refcnt_is_zero=0
+	# Since we are looking for a directory we must adopt the
+	# specific directory used by scripts/Makefile.lib for
+	# KBUILD_MODNAME
+	local module_sys=${module//-/_}
+
+	# Check if module is built-in or not loaded
+	if [[ ! -d "/sys/module/$module_sys" ]]; then
+		return 0
+	fi
+
+	# Check if this is a built-in module (no refcnt file means built-in)
+	if [[ ! -f "/sys/module/$module_sys/refcnt" ]]; then
+		return 0
+	fi
+
+	if [[ -n $MODPROBE_HAS_WAIT ]]; then
+		local timeout_ms=$((MODPROBE_PATIENT_RM_TIMEOUT_SECONDS * 1000))
+		modprobe --remove --wait="${timeout_ms}" "$module"
+		mod_ret=$?
+		if [[ $mod_ret -ne 0 ]]; then
+			echo "kmod patient module removal for $module timed out waiting for refcnt to become 0 using timeout of $max_tries_max returned $mod_ret" >&2
+		elif ! _patient_rmmod_check_refcnt "$module_sys"; then
+			echo "modprobe with --wait option succeeded but still $module has references" >&2
+			mod_ret=1
+		fi
+		return $mod_ret
+	fi
+
+	for ((max_tries=max_tries_max; max_tries != 0; max_tries--)); do
+		if _patient_rmmod_check_refcnt "$module_sys"; then
+			refcnt_is_zero=1
+			break
+		fi
+		sleep 1
+	done
+
+	if [[ $refcnt_is_zero -ne 1 ]]; then
+		echo "custom patient module removal for $module timed out waiting for refcnt to become 0 using timeout of $max_tries_max" 2>&1
+		return 1
+	fi
+
+	# If we ran out of time but our refcnt check confirms we had
+	# a refcnt of 0, just try to remove the module once.
+	if [[ "$max_tries" == "0" ]]; then
+		modprobe --remove "$module"
+		return $?
+	fi
+
+	# If we have extra time left. Use the time left to now try to
+	# persistently remove the module. We do this because although through
+	# the above we found refcnt to be 0, removal can still fail since
+	# userspace can always race to bump the refcnt. An example is any
+	# blkdev_open() calls against a block device. These issues have been
+	# tracked and documented in the following bug reports, which justifies
+	# our need to do this in userspace:
+	# https://bugzilla.kernel.org/show_bug.cgi?id=212337
+	# https://bugzilla.kernel.org/show_bug.cgi?id=214015
+	while [[ $max_tries != 0 ]] && [[ -d /sys/module/$module_sys ]]; do
+		modprobe --remove "$module" 2> /dev/null
+		mod_ret=$?
+		if [[ $mod_ret == 0 ]]; then
+			break;
+		fi
+		sleep 1
+		((max_tries--))
+	done
+
+	if [[ $mod_ret -ne 0 ]]; then
+		echo "custom patient module removal for $module timed out trying to remove using timeout of $max_tries_max last try returned $mod_ret" 2>&1
+	fi
+
+	return $mod_ret
+}
+
+# Arguments: module to unload ($1) and retry count ($2).
+_unload_module() {
+	local i m=$1 rc=${2:-1} reason
+
+	[ ! -e "/sys/module/$m" ] && return 0
+	for ((i=rc;i>0;i--)); do
+		reason=$(modprobe -r "$m" 2>&1)
+		[ ! -e "/sys/module/$m" ] && return 0
+		sleep .1
+	done
+	echo "${reason}" >&2
+	return 1
+}
+
+_unload_modules() {
+	local i reason
+
+	for ((i=${#MODULES_TO_UNLOAD[@]}; i > 0; i--)); do
+		if ! reason=$(_patient_rmmod "${MODULES_TO_UNLOAD[i-1]}" \
+					     2>&1); then
+			echo "${reason}" >&2
+		fi
+	done
+
+	unset MODULES_TO_UNLOAD
+}
+
+_check_and_call_test() {
+	local postfix
+
+	if declare -fF requires >/dev/null; then
+		requires
+	fi
+
+	[[ -n $COND_DESC ]] && postfix=_${COND_DESC//[ =]/_}
+	RESULTS_DIR="$OUTPUT/nodev${postfix}"
+	_call_test test
+	_unload_modules
+}
+
+_check_and_call_test_device() {
+	local postfix
+	local unset_skip_reason
+	local ret=0
+	local fallback=0
+	local fb_dev_file
+
+	if declare -fF requires >/dev/null; then
+		requires
+	fi
+
+	if [[ ${#TEST_DEVS[@]} -eq 0 ]] && \
+		   declare -fF fallback_device >/dev/null; then
+		TEST_DEVS[0]=fallback
+	fi
+
+	[[ -n $COND_DESC ]] && postfix=_${COND_DESC//[ =]/_}
+	for TEST_DEV in "${TEST_DEVS[@]}"; do
+		if [[ $TEST_DEV == fallback ]]; then
+			if [[ -v SKIP_REASONS ]]; then
+				_output_notrun "$TEST_NAME"
+				return 0
+			fi
+
+			# Use a tmp file to keep bash context in fallback_device
+			fb_dev_file="${OUTPUT}/${TEST_NAME/\//_}_fallback_dev"
+			if ! fallback_device > "$fb_dev_file"; then
+				_warning "$TEST_NAME: fallback_device call failure"
+				return 0
+			fi
+			TEST_DEV=$(<"$fb_dev_file")
+			rm -f "$fb_dev_file"
+
+			if ! _find_sysfs_dirs "$TEST_DEV"; then
+				_warning "$TEST_NAME: could not find sysfs directory for ${TEST_DEV}"
+				cleanup_fallback_device
+				return 0
+			fi
+			fallback=1
+		fi
+
+		TEST_DEV_SYSFS="${TEST_DEV_SYSFS_DIRS["$TEST_DEV"]}"
+		TEST_DEV_PART_SYSFS="${TEST_DEV_PART_SYSFS_DIRS["$TEST_DEV"]}"
+
+		unset_skip_reason=0
+		if [[ ! -v SKIP_REASONS ]]; then
+			unset_skip_reason=1
+			if (( !CAN_BE_ZONED )) && _test_dev_is_zoned; then
+				SKIP_REASONS+=("${TEST_DEV} is a zoned block device")
+			elif declare -fF device_requires >/dev/null; then
+				device_requires
+			fi
+		fi
+		RESULTS_DIR="$OUTPUT/$(basename "$TEST_DEV")""$postfix"
+		# Avoid "if" and "!" for errexit in test cases
+		_call_test test_device
+		# shellcheck disable=SC2181
+		(($? != 0)) && ret=1
+		if (( unset_skip_reason )); then
+			unset SKIP_REASONS
+		fi
+
+		if (( fallback )); then
+			cleanup_fallback_device
+			unset "TEST_DEV_SYSFS_DIRS[${TEST_DEV}]]"
+			unset "TEST_DEV_PART_SYSFS_DIRS[${TEST_DEV}]"
+			TEST_DEVS=()
+		fi
+
+		_unload_modules
+	done
+
+	return $ret
+}
+
+_get_test_device_array_key() {
+	local key
+
+	for key in "${!TEST_CASE_DEV_ARRAY[@]}"; do
+		if [[ $TEST_NAME == "$key" ]]; then
+			echo "$TEST_NAME"
+			return
+		fi
+	done
+
+	for key in "${!TEST_CASE_DEV_ARRAY[@]}"; do
+		if [[ $TEST_NAME =~ $key ]]; then
+			echo "$key"
+			return
+		fi
+	done
+
+	return 1
+}
+
+_check_and_call_test_device_array() {
+	local array_name="" key
+	local ret=0 i
+	local -a devs sysfs_dirs
+
+	if declare -fF requires >/dev/null; then
+		requires
+	fi
+
+	TEST_DEV_ARRAY=()
+	if key=$(_get_test_device_array_key); then
+		IFS=" " read -r -a devs <<< "${TEST_CASE_DEV_ARRAY[$key]}"
+		IFS=" " read -r -a sysfs_dirs <<< \
+		   "${TEST_CASE_DEV_ARRAY_SYSFS_DIRS[$key]}"
+		for ((i = 0; i < "${#devs[@]}"; i++)); do
+			TEST_DEV=${devs[$i]}
+			TEST_DEV_SYSFS=${sysfs_dirs[$i]}
+			if (( !CAN_BE_ZONED )) && _test_dev_is_zoned; then
+				SKIP_REASONS+=("${TEST_DEV} is a zoned block device")
+			elif declare -fF device_requires >/dev/null; then
+				device_requires
+			fi
+			TEST_DEV_ARRAY+=("$TEST_DEV")
+			TEST_DEV_ARRAY_SYSFS_DIRS[$TEST_DEV]=$TEST_DEV_SYSFS
+			[[ -n $array_name ]] && array_name+="_"
+			array_name+="$(basename "$TEST_DEV")"
+		done
+	fi
+
+	if ((${#TEST_DEV_ARRAY[@]} == 0)); then
+		SKIP_REASONS+=("TEST_CASE_DEV_ARRAY is not defined for ${TEST_NAME}")
+	fi
+
+	unset TEST_DEV
+	unset TEST_DEV_SYSFS
+	RESULTS_DIR="$OUTPUT/${array_name}${postfix}"
+	# Avoid "if" and "!" for errexit in test cases
+	_call_test test_device_array
+	# shellcheck disable=SC2181
+	(($? != 0)) && ret=1
+
+	TEST_DEV_ARRAY=()
+	for ((i = 0; i < "${#devs[@]}"; i++)); do
+		unset "TEST_DEV_ARRAY_SYSFS_DIRS[${devs[i]}]"
+	done
+
+	_unload_modules
+	return $ret
+}
+
+_run_test() {
+	TEST_NAME="$1"
+	CAN_BE_ZONED=0
+	CHECK_DMESG=1
+	DMESG_FILTER="cat"
+	RUN_FOR_ZONED=0
+	COND_DESC=""
+	MODULES_TO_UNLOAD=()
+
+	local nr_conds cond_i
+	local ret=0
+
+	# Ensure job control monitor mode is off in the sub-shell for test case
+	# runs to suppress job status output.
+	set +m
+
+	# shellcheck disable=SC1090
+	. "tests/${TEST_NAME}"
+
+	if declare -fF test >/dev/null; then
+		if ((RUN_ZONED_TESTS && CAN_BE_ZONED)); then
+			. "common/zoned"
+		fi
+		if declare -fF set_conditions >/dev/null; then
+			nr_conds=$(set_conditions)
+			for ((cond_i = 0; cond_i < nr_conds; cond_i++)); do
+				set_conditions $cond_i
+				_check_and_call_test
+				ret=$(( ret || $? ))
+				unset SKIP_REASONS
+			done
+		else
+			_check_and_call_test
+			ret=$?
+		fi
+	elif declare -fF test_device >/dev/null; then
+		if declare -fF set_conditions >/dev/null; then
+			nr_conds=$(set_conditions)
+			for ((cond_i = 0; cond_i < nr_conds; cond_i++)); do
+				set_conditions $cond_i
+				_check_and_call_test_device
+				ret=$(( ret || $? ))
+				unset SKIP_REASONS
+			done
+		else
+			_check_and_call_test_device
+			ret=$?
+		fi
+	else
+		_check_and_call_test_device_array
+		ret=$?
+	fi
+
+	return $ret
+}
+
+_run_group() {
+	local tests=("$@")
+	local group="${tests["0"]%/*}"
+	local key
+	local -a devs sysfs_dirs
+
+	# shellcheck disable=SC1090
+	. "tests/${group}/rc"
+
+	if declare -fF group_setup >/dev/null; then
+		group_setup
+	fi
+
+	if declare -fF group_requires >/dev/null; then
+		group_requires
+		if [[ -v SKIP_REASONS ]]; then
+			_output_notrun "${group}/***"
+			return 0
+		fi
+	fi
+
+	if declare -fF group_device_requires >/dev/null; then
+		local i
+		for i in "${!TEST_DEVS[@]}"; do
+			TEST_DEV="${TEST_DEVS[$i]}"
+			TEST_DEV_SYSFS="${TEST_DEV_SYSFS_DIRS["$TEST_DEV"]}"
+			# shellcheck disable=SC2034
+			TEST_DEV_PART_SYSFS="${TEST_DEV_PART_SYSFS_DIRS["$TEST_DEV"]}"
+			group_device_requires
+			if [[ -v SKIP_REASONS ]]; then
+				_output_notrun "${group}/*** => $(basename "$TEST_DEV")"
+				unset "TEST_DEVS[$i]"
+				unset SKIP_REASONS
+			fi
+		done
+		# Fix the array indices.
+		TEST_DEVS=("${TEST_DEVS[@]}")
+		unset TEST_DEV
+
+		for key in "${!TEST_CASE_DEV_ARRAY[@]}"; do
+			if [[ ! $key =~ ${group} ]]; then
+				continue
+			fi
+			IFS=" " read -r -a devs <<< \
+			   "${TEST_CASE_DEV_ARRAY[$key]}"
+			IFS=" " read -r -a sysfs_dirs <<< \
+			   "${TEST_CASE_DEV_ARRAY_SYSFS_DIRS[$key]}"
+			for ((i = 0; i < ${#devs[@]}; i++)); do
+				TEST_DEV="${devs[$i]}"
+				TEST_DEV_SYSFS="${sysfs_dirs[$i]}"
+				unset TEST_DEV_PART_SYSFS
+				group_device_requires
+				if [[ -v SKIP_REASONS ]]; then
+					_output_notrun "${group}/*** => $(basename "$TEST_DEV")"
+					unset "devs[$i]"
+					unset "sysfs_dirs[$i]"
+					unset SKIP_REASONS
+				fi
+			done
+			# Fix the array elements.
+			TEST_CASE_DEV_ARRAY["$key"]="${devs[*]}"
+			TEST_CASE_DEV_ARRAY_SYSFS_DIRS["$key"]="${sysfs_dirs[*]}"
+			unset TEST_DEV
+			unset TEST_DEV_SYSFS
+		done
+	fi
+
+	local ret=0
+	local test_name
+	for test_name in "${tests[@]}"; do
+		# Avoid "if" and "!" for errexit in test cases
+		( _run_test "$test_name" )
+		# shellcheck disable=SC2181
+		(($? != 0)) && ret=1
+	done
+	return $ret
+}
+
+_find_sysfs_dirs() {
+	local test_dev="$1"
+	local array_test_name="$2"
+	local sysfs_path sysfs_paths
+	local major=$((0x$(stat -L -c '%t' "$test_dev")))
+	local minor=$((0x$(stat -L -c '%T' "$test_dev")))
+
+	# Get the canonical sysfs path
+	if ! sysfs_path="$(realpath "/sys/dev/block/${major}:${minor}")"; then
+		return 1
+	fi
+
+	if [[ -n $array_test_name ]]; then
+		sysfs_paths=${TEST_CASE_DEV_ARRAY_SYSFS_DIRS["$array_test_name"]}
+		[[ -n $sysfs_paths ]] && sysfs_paths="${sysfs_paths} "
+		sysfs_paths+="$sysfs_path"
+		TEST_CASE_DEV_ARRAY_SYSFS_DIRS["$array_test_name"]="${sysfs_paths}"
+	elif [[ -r "${sysfs_path}"/partition ]]; then
+		# If the device is a partition device, cut the last device name
+		# of the canonical sysfs path to access to the sysfs of its
+		# holder device.
+		#   e.g.   .../block/sda/sda1  ->  ...block/sda
+		TEST_DEV_SYSFS_DIRS["$test_dev"]="${sysfs_path%/*}"
+		TEST_DEV_PART_SYSFS_DIRS["$test_dev"]="${sysfs_path}"
+	else
+		TEST_DEV_SYSFS_DIRS["$test_dev"]="${sysfs_path}"
+		TEST_DEV_PART_SYSFS_DIRS["$test_dev"]=""
+	fi
+}
+
+declare -A TEST_DEV_SYSFS_DIRS
+declare -A TEST_DEV_PART_SYSFS_DIRS
+declare -a TEST_DEV_ARRAY
+# shellcheck disable=SC2034
+declare -A TEST_DEV_ARRAY_SYSFS_DIRS
+declare -A TEST_CASE_DEV_ARRAY
+declare -A TEST_CASE_DEV_ARRAY_SYSFS_DIRS
+_check() {
+	# shellcheck disable=SC2034
+	SRCDIR="$(realpath src)"
+
+	local test_dev test_name
+	local -a all_test_devs_in_array
+	local km_log="${OUTPUT}/start.kmemleak"
+
+	for test_name in "${!TEST_CASE_DEV_ARRAY[@]}"; do
+		IFS=" " read -r -a all_test_devs_in_array <<< \
+			   "${TEST_CASE_DEV_ARRAY[$test_name]}"
+	done
+
+	for test_dev in "${TEST_DEVS[@]}" "${all_test_devs_in_array[@]}"; do
+		if [[ ! -e $test_dev ]]; then
+			_error "${test_dev} does not exist"
+		elif [[ ! -b $test_dev ]]; then
+			_error "${test_dev} is not a block device"
+		fi
+	done
+
+	for test_dev in "${TEST_DEVS[@]}"; do
+		if ! _find_sysfs_dirs "$test_dev"; then
+			_error "could not find sysfs directory for ${test_dev}"
+		fi
+	done
+
+	for test_name in "${!TEST_CASE_DEV_ARRAY[@]}"; do
+		for test_dev in ${TEST_CASE_DEV_ARRAY[$test_name]}; do
+			if ! _find_sysfs_dirs "$test_dev" "$test_name"; then
+				_error "could not find sysfs directory for ${test_dev}"
+			fi
+		done
+	done
+
+	if ((KMEMLEAK)); then
+		# check if memory is already leaked before blktests run
+		_setup_kmemleak
+		if ! _check_kmemleak "$km_log"; then
+			echo "Memory leak detected before test run start. See '${km_log}'."
+		fi
+	fi
+
+	local test_name group prev_group
+	local tests=()
+	local ret=0
+	while IFS= read -r -d '' test_name; do
+		group="${test_name%/*}"
+		if [[ $group != "$prev_group" ]]; then
+			prev_group="$group"
+			if [[ ${#tests[@]} -gt 0 ]]; then
+				# Avoid "if" and "!" for errexit in test cases
+				( _run_group "${tests[@]}" )
+				# shellcheck disable=SC2181
+				(($? != 0)) && ret=1
+				tests=()
+			fi
+		fi
+		tests+=("$test_name")
+	done < <(_find_tests "$@" | sort -zu)
+
+	if [[ ${#tests[@]} -gt 0 ]]; then
+		# Avoid "if" and "!" for errexit in test cases
+		( _run_group "${tests[@]}" )
+		# shellcheck disable=SC2181
+		(($? != 0)) && ret=1
+	fi
+
+	return $ret
+}
+
+_check_dependencies() {
+	local v1 v2 v3
+	local -A required_commands_and_packages
+	local cmd
+
+	# Require bash version 4.3
+	IFS='.' read -r v1 v2 v3 < <(bash --version | grep version | head -1 | \
+					   sed 's/.*version \([0-9.]\+\).*/\1/')
+	if ((v1 * 65536 + v2 * 256 + v3 < 4 * 65536 + 3 * 256)); then
+		_warning "bash version is older than 4.3"
+	fi
+
+	# Check dependent commands to run blktests
+	required_commands_and_packages[dd]="GNU coreutils"
+	required_commands_and_packages[gawk]="GNU awk"
+	required_commands_and_packages[blockdev]="util-linux"
+	required_commands_and_packages[fio]="fio"
+	required_commands_and_packages[udevadm]="systemd-udev"
+
+	for cmd in "${!required_commands_and_packages[@]}"; do
+		command -v "$cmd" &> /dev/null && continue
+		_warning "$cmd is not available." \
+			 "Install ${required_commands_and_packages[$cmd]}."
+	done
+}
+
+usage () {
+	USAGE_STRING="\
+usage: $0 [options] [group-or-test...]
+
+Run blktests
+
+Test runs:
+  -d, --device-only	 only run tests which use a test device from the
+			 TEST_DEVS config setting
+
+  -o, --output=DIR	 output results to the given directory (the default is
+			 ./results)
+
+  -q, --quick=SECONDS	 do a quick run (only run quick tests and limit the
+			 runtime of longer tests to the given timeout,
+			 defaulting to 30 seconds)
+
+  -x, --exclude=TEST	 exclude a test (or test group) from the list of
+			 tests to run
+
+Miscellaneous:
+  -c, --config=FILE	 load configuration from FILE instead of the default
+			 (\"./config\"); if this option is used multiple times,
+			 all of the given files are loaded
+
+  -h, --help             display this help message and exit"
+
+	case "$1" in
+		out)
+			echo "$USAGE_STRING"
+			exit 0
+			;;
+		err)
+			echo "$USAGE_STRING" >&2
+			exit 1
+			;;
+	esac
+}
+
+_check_dependencies
+
+if ! TEMP=$(getopt -o 'do:q::x:c:h' --long 'device-only,quick::,exclude:,output:,config:,help' -n "$0" -- "$@"); then
+	exit 1
+fi
+
+eval set -- "$TEMP"
+unset TEMP
+
+LOADED_CONFIG=0
+OPTION_EXCLUDE=()
+while true; do
+	case "$1" in
+		'-d'|'--device-only')
+			OPTION_DEVICE_ONLY=1
+			shift
+			;;
+		'-o'|'--output')
+			OPTION_OUTPUT="$2"
+			shift 2
+			;;
+		'-q'|'--quick')
+			OPTION_QUICK_RUN=1
+			OPTION_TIMEOUT="$2"
+			shift 2
+			;;
+		'-x'|'--exclude')
+			# shellcheck disable=SC2190
+			OPTION_EXCLUDE+=("$2")
+			shift 2
+			;;
+		'-c'|'--config')
+			# shellcheck source=/dev/null
+			. "$2"
+			LOADED_CONFIG=1
+			shift 2
+			;;
+		'-h'|'--help')
+			usage out
+			;;
+		'--')
+			shift
+			break
+			;;
+		*)
+			usage err
+			;;
+	esac
+done
+
+# Load the default configuration file if "-c" was not used.
+if [[ $LOADED_CONFIG -eq 0 && -r config ]]; then
+	# shellcheck source=/dev/null
+	. config
+fi
+
+# Options on the command line take precedence over the configuration file. If
+# neither set the option and we didn't get it from the environment, then we
+# fall back to the default.
+DEVICE_ONLY="${OPTION_DEVICE_ONLY:-${DEVICE_ONLY:-0}}"
+
+OUTPUT="${OPTION_OUTPUT:-${OUTPUT:-results}}"
+
+QUICK_RUN="${OPTION_QUICK_RUN:-${QUICK_RUN:-0}}"
+if [[ -n $OPTION_QUICK_RUN && $OPTION_QUICK_RUN -ne 0 ]]; then
+	TIMEOUT="${OPTION_TIMEOUT:-${TIMEOUT:-30}}"
+fi
+
+if [[ "${EXCLUDE:-}" ]] && ! declare -p EXCLUDE | grep -q '^declare -a'; then
+	# If EXCLUDE was not defined as an array, convert it to one.
+	# shellcheck disable=SC2128,SC2190,SC2206
+	EXCLUDE=($EXCLUDE)
+elif [[ ! "${EXCLUDE:-}" ]]; then
+	EXCLUDE=()
+fi
+# Convert the exclude list to an associative array. The lists from the
+# configuration file and command line options are merged.
+TEMP_EXCLUDE=("${EXCLUDE[@]}" "${OPTION_EXCLUDE[@]}")
+unset EXCLUDE
+declare -A EXCLUDE
+for filter in "${TEMP_EXCLUDE[@]}"; do
+	EXCLUDE["$filter"]=1
+done
+unset OPTION_EXCLUDE TEMP_EXCLUDE
+
+if [[ "${TEST_DEVS:-}" ]] && ! declare -p TEST_DEVS | grep -q '^declare -a'; then
+	# If TEST_DEVS was not defined as an array, convert it to one.
+	# shellcheck disable=SC2128,SC2206
+	TEST_DEVS=($TEST_DEVS)
+elif [[ ! "${TEST_DEVS:-}" ]]; then
+	TEST_DEVS=()
+fi
+
+: "${LOGGER_PROG:="$(type -P logger || echo true)"}"
+: "${RUN_ZONED_TESTS:=0}"
+: "${NORMAL_USER:=''}"
+
+# Sanity check options.
+if [[ $QUICK_RUN -ne 0 && ! "${TIMEOUT:-}" ]]; then
+	_error "QUICK_RUN specified without TIMEOUT"
+fi
+
+if [[ $DEVICE_ONLY -ne 0 && ${#TEST_DEVS[@]} -eq 0 ]]; then
+	_error "DEVICE_ONLY specified without TEST_DEVS"
+fi
+
+mkdir -p "$OUTPUT"
+OUTPUT="$(realpath "$OUTPUT")"
+
+_check "$@"

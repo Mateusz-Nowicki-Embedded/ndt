@@ -1,0 +1,53 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2017-2018 Western Digital Corporation or its affiliates.
+#
+# Test many target bdev-ns creation/deletion under one subsystem.
+
+. tests/nvme/rc
+
+DESCRIPTION="create/delete many NVMeOF block device-backed ns and test discovery"
+
+requires() {
+	_nvme_requires
+	_require_nvme_trtype_is_loop
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	_setup_nvmet
+
+	local port
+	local i iterations="${NVME_NUM_ITER}"
+	local loop_dev
+	local nsid
+
+	loop_dev="$(losetup -f)"
+	local genctr=1
+
+	_create_nvmet_subsystem
+
+	for ((i = 1; i <= iterations; i++)); do
+		nsid=$((def_nsid + i - 1))
+		_create_nvmet_ns --nsid "${nsid}" \
+				 --blkdev "${loop_dev}" > /dev/null
+	done
+
+	port="$(_create_nvmet_port)"
+	_add_nvmet_subsys_to_port "$port" "${def_subsysnqn}"
+
+	genctr=$(_check_genctr "${genctr}" "$port" \
+			       "adding a subsystem to a port")
+
+	_remove_nvmet_subsystem_from_port "${port}" "${def_subsysnqn}"
+	_remove_nvmet_port "${port}"
+
+	_remove_nvmet_subsystem "${def_subsysnqn}"
+
+	echo "Test complete"
+}

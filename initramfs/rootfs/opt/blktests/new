@@ -1,0 +1,293 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+
+set -e
+shopt -s extglob
+
+_error() {
+	echo "$0: $*" >&2
+	exit 1
+}
+
+prompt_yes_no() {
+	if [[ $2 =~ ^[Yy] ]]; then
+		local default=0
+		local prompt="$1 [Y/n] "
+	else
+		local default=1
+		local prompt="$1 [y/N] "
+	fi
+
+	local yn
+	read -r -n 1 -p "${prompt}" yn
+	if [[ -n "${yn}" ]]; then
+		echo
+	fi
+	if [[ "${yn}" =~ ^[Yy] ]]; then
+		return 0
+	elif [[ "${yn}" =~ ^[Nn] ]]; then
+		return 1
+	else
+		return $default
+	fi
+}
+
+echo "Available test groups:"
+find tests -mindepth 1 -maxdepth 1 -type d -not -name meta -printf '    %P\n' | sort
+
+read -r -p "Category for new test (pick one of the above or create a new one): " group
+
+if [[ -z $group ]]; then
+	exit 1
+fi
+
+if [[ $group =~ [[:space:]/] ]]; then
+	_error 'group name must not contain whitespace or "/"'
+fi
+
+if [[ ! -e tests/${group} ]]; then
+	if ! prompt_yes_no "Category does not exist; create it?"; then
+		exit 1
+	fi
+	mkdir -p "tests/${group}"
+	cat << EOF > "tests/${group}/rc"
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) $(date +%Y) TODO YOUR NAME HERE
+#
+# TODO: provide a brief description of the group here.
+
+. common/rc
+# TODO: source any more common helpers needed for this group.
+# . common/foo
+
+# TODO: if this test group has any extra requirements, it should define a
+# group_requires() function. If tests in this group cannot be run,
+# group_requires() should add strings to the \$SKIP_REASONS array which
+# describe why the group cannot be run.
+#
+# Usually, group_requires() just needs to check that any necessary programs and
+# kernel features are available using the _have_foo helpers. If
+# group_requires() adds strings to \$SKIP_REASONS, all tests in this group will
+# be skipped.
+group_requires() {
+	_have_root
+}
+
+# TODO: if this test group has extra requirements for what devices it can be
+# run on, it should define a group_device_requires() function. If tests in this
+# group cannot be run on the test device, it should add strings to
+# \$SKIP_REASONS. \$TEST_DEV is the full path of the block device (e.g.,
+# /dev/nvme0n1 or /dev/sda1), and \$TEST_DEV_SYSFS is the sysfs path of the
+# disk (not the partition, e.g., /sys/block/nvme0n1 or /sys/block/sda). If
+# the target device is a partition device, \$TEST_DEV_PART_SYSFS is the sysfs
+# path of the partition device (e.g., /sys/block/nvme0n1/nvme0n1p1 or
+# /sys/block/sda/sda1). Otherwise, \$TEST_DEV_PART_SYSFS is an empty string.
+#
+# Usually, group_device_requires() just needs to check that the test device is
+# the right type of hardware or supports any necessary features using the
+# _require_test_dev_foo helpers. If group_device_requires() adds strings to
+# \$SKIP_REASONS, all tests in this group will be skipped on that device.
+# group_device_requires() {
+# 	_require_test_dev_is_foo && _require_test_dev_supports_bar
+# }
+
+# TODO: define any helpers that are specific to this group.
+EOF
+	echo "Created tests/${group}/rc"
+fi
+
+seq=0
+for test in tests/"$group"/+([0-9]); do
+	if [[ -e $test ]]; then
+		seq=${test##tests/"${group}"/+(0)}
+	fi
+done
+
+test_name="${group}/$(printf "%03d" $((seq + 1)))"
+
+cat << EOF > "tests/${test_name}"
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) $(date +%Y) TODO YOUR NAME HERE
+#
+# TODO: provide a description of the test here, i.e., what it tests and how. If
+# this is a regression test for a patch, reference the patch title:
+#
+# Regression test for patch "blk-stat: fix blk_stat_sum() if all samples are
+# batched".
+#
+# For a commit, use the first 12 characters of the commit hash and the one-line
+# commit summary:
+#
+# Regression test for commit efd4b81abbe1 ("blk-stat: fix blk_stat_sum() if all
+# samples are batched").
+
+. tests/${group}/rc
+# TODO: source any more common helpers needed for this test.
+
+# TODO: fill in a very brief description of what this test does. The
+# description should complete the sentence "This test will...". For example,
+# "run a mixed read/write workload" would be a good description.
+DESCRIPTION=""
+
+# TODO: if this test completes quickly (i.e., in ~30 seconds or less on
+# reasonable hardware), uncomment the line below.
+# QUICK=1
+
+# TODO: if this test honors the configured \$TIMEOUT, uncomment the line below.
+# This is for tests that can potentially run for a long time but where it's
+# possible to limit the runtime (e.g., with the \`timeout\` command or with
+# fio --runtime, which is what the _run_fio helper does). A test shouldn't be
+# both QUICK and TIMED.
+# TIMED=1
+
+# TODO: dmesg is checked for oopses, warnings, etc. after each test run by
+# default. You can suppress this by defining:
+# CHECK_DMESG=0
+# Alternatively, you can filter out any unimportant messages in dmesg like so:
+# DMESG_FILTER="grep -v sysfs"
+
+# TODO: if this test can be run for both regular block devices and zoned block
+# devices, uncomment the line below.
+# CAN_BE_ZONED=1
+
+# TODO: if this test has any extra requirements, it should define a requires()
+# function. If the test cannot be run, requires() should add strings to
+# \$SKIP_REASONS. Usually, requires() just needs to check that any necessary
+# programs and kernel features are available using the _have_foo helpers.
+# If requires() adds strings to \$SKIP_REASONS, the test is skipped.
+# requires() {
+# 	_have_foo
+# }
+
+# TODO: if this test has extra requirements for what devices it can be run on,
+# it should define a device_requires() function. If this test cannot be run on
+# the test device, it should add strings to \$SKIP_REASONS. \$TEST_DEV is the
+# full path of the block device (e.g., /dev/nvme0n1 or /dev/sda1), and
+# \$TEST_DEV_SYSFS is the sysfs path of the disk (not the partition, e.g.,
+# /sys/block/nvme0n1 or /sys/block/sda). If the target device is a partition
+# device, \$TEST_DEV_PART_SYSFS is the sysfs path of the partition device
+# (e.g., /sys/block/nvme0n1/nvme0n1p1 or /sys/block/sda/sda1). Otherwise,
+# \$TEST_DEV_PART_SYSFS is an empty string.
+#
+# Usually, device_requires() just needs to check that the test device is the
+# right type of hardware or supports any necessary features using the
+# _require_test_dev_foo helpers. If device_requires() adds strings to
+# \$SKIP_REASONS, the test will be skipped on that device.
+# device_requires() {
+# 	_require_test_dev_is_foo && _require_test_dev_supports_bar
+# }
+
+# TODO: if the test case can run the same test for different conditions, define
+# the helper function "set_conditions". When no argument is specified, return
+# the number of condition variations. Blktests repeats the test case as many
+# times as the returned number. When its argument is specified, refer to it as
+# the condition variation index and set up the conditions for it. Also set the
+# global variable COND_DESC which is printed at the test case run and used for
+# the result directory name. Blktests calls set_conditions() before each run of
+# the test case incrementing the argument index from 0.
+# set_conditions() {
+# 	local index=\$1
+#
+# 	if [[ -z \$index ]]; then
+# 		echo 2  # return number of condition variations
+# 		return
+# 	fi
+#
+# 	# Set test conditions based on the $index
+# 	...
+# 	COND_DESC="Describe the conditions shortly"
+# }
+
+# TODO: define the test. The output of this function (stdout and stderr) will
+# be compared to tests/\${TEST_NAME}.out. If it does not match, the test is
+# considered a failure. If the test runs a command which has unnecessary
+# output, either redirect that output to \$FULL or /dev/null, or filter out the
+# unimportant parts (e.g., with grep or the _filter_foo helpers).
+#
+# Additionally, if the test function returns non-zero, it is considered a
+# failure. You should prefer letting the test fail because of broken output
+# over, say, checking the exit status of every command you run.
+#
+# If the test cannot be run, this function may add strings to \$SKIP_REASONS
+# and return. In that case, the return value and output are ignored, and the
+# test is considered skipped. This should only be done when the requirements
+# can only be detected with a non-trivial amount of setup; use
+# group_requires(), requires(), and/or device_requires() instead when possible.
+#
+# Various variables are defined for the test:
+#    - \$TEST_NAME -- the full name of the test.
+#    - \$TMPDIR -- a temporary directory deleted after the test is run.
+#    - \$SRCDIR -- absolute path of the src/ subdirectory
+#    - \$FULL -- a file where the test may log verbose output (e.g., the output
+#               of fio or mkfs).
+#    - \$TEST_RUN -- an associative array of additional test data to display
+#                   after the test is run and store for comparison on future
+#                   test runs. Use like TEST_RUN[iops]="\$(measure_iops)".
+#    - \$TIMEOUT -- an optional timeout configured by the user. If possible, limit
+#                  the runtime of the entire test to this value if it is set.
+#
+# Many tests do not need a test device (usually because they set up their own
+# virtual devices, like null-blk or loop). These tests should define the test()
+# function.
+#
+# Tests that require a test device should rename test() to test_device(). These
+# tests will be run with a few more variables defined:
+#    - \$TEST_DEV -- the block device to run the test on (e.g., /dev/sda1). The
+#                    device is taken from TEST_DEVS in the config for each run.
+#    - \$TEST_DEV_SYSFS -- the sysfs directory of the device (e.g.,
+#                         /sys/block/sda). In general, you should use the
+#                         _test_dev_queue_{get,set} helpers. If the device is a
+#                         partition, this is the directory of its holder
+#                         device.
+#    - \$TEST_DEV_PART_SYSFS -- the sysfs directory of the device if the device
+#                               is a partition device (e.g.,
+#                               /sys/block/sda/sda1). If the device is not a
+#                               partition, this is an empty string.
+#
+# Tests that require multiple test devices should rename test() to
+# test_device_array(). These tests will be run with variables defined below
+# instead of TEST_DEV and TEST_DEV_SYSFS:
+#    - \$TEST_DEV_ARRAY -- the block devices to run the test on. The devices are
+#                          taken from TEST_CASE_DEV_ARRAY defined in the config.
+#    - \$TEST_DEV_ARRAY_SYSFS -- the sysfs directories of the devices in the
+#                                form of an associative array. Use values in
+#                                TEST_DEV_ARRAY as the keys.
+test() {
+	echo "Running \${TEST_NAME}"
+
+	# TODO: fill in the test case.
+
+	echo "Test complete"
+}
+
+# Finally, some coding style guidelines:
+# - Indent with tabs.
+# - Don't add a space before the parentheses or a newline before the curly brace
+#   in function definitions.
+# - Variables set and used by the testing framework are in caps with underscores.
+#   E.g., TEST_NAME and GROUPS. Variables local to the test are lowercase
+#   with underscores.
+# - Functions defined by the testing framework or group scripts, including
+#   helpers, have a leading underscore. E.g., _have_scsi_debug. Functions local
+#   to the test should not have a leading underscore.
+# - Both [[ ]] form and [ ] form are fine for tests. [[ ]] is preferred.
+# - Always quote variable expansions unless the variable is a number or inside of
+#   a [[ ]] test.
+# - Use the \$() form of command substitution instead of backticks.
+# - Use bash for loops instead of seq. E.g., for ((i = 0; i < 10; i++)), not
+#   for i in \$(seq 0 9).
+#
+# Please run \`make check\` after your test is done to check for shell
+# scripting errors and other mistakes.
+EOF
+chmod +x "tests/${test_name}"
+echo "Created tests/${test_name}"
+
+cat << EOF > "tests/${test_name}.out"
+Running ${test_name}
+Test complete
+EOF
+echo "Created tests/${test_name}.out"

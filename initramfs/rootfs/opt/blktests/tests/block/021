@@ -1,0 +1,42 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2018 Ming Lei <ming.lei@redhat.com>
+#
+# Test reading and writing nr_requests with different schedulers. Regression
+# test for 32a50fabb334 ("blk-mq: update nr_requests when switching to 'none'
+# scheduler").
+
+. tests/block/rc
+. common/null_blk
+
+DESCRIPTION="read/write nr_requests on null-blk with different schedulers"
+QUICK=1
+CAN_BE_ZONED=1
+
+requires() {
+	_have_null_blk
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	if ! _configure_null_blk nullb1 power=1; then
+		return 1
+	fi
+
+	local max_nr
+	local nr
+
+	for sched in $(_io_schedulers nullb1); do
+		echo "Testing $sched" >> "$FULL"
+		echo "$sched" > /sys/block/nullb1/queue/scheduler
+		max_nr="$(cat /sys/block/nullb1/queue/nr_requests)"
+		for ((nr = 4; nr <= max_nr; nr++)); do
+			echo "$nr" > /sys/block/nullb1/queue/nr_requests
+		done
+	done
+
+	_exit_null_blk
+
+	echo "Test complete"
+}

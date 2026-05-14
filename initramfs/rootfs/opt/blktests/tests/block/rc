@@ -1,0 +1,11 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+#
+# Generic block layer tests.
+
+. common/rc
+
+group_requires() {
+	_have_root
+}

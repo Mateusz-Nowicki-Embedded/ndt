@@ -1,0 +1,78 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Jens Axboe
+#
+# Test if IO polling works, both classic and hybrid mode
+
+. tests/block/rc
+. common/iopoll
+. common/null_blk
+
+DESCRIPTION="test classic and hybrid IO polling"
+TIMED=1
+
+requires() {
+	_have_fio_with_poll
+}
+
+device_requires() {
+	_require_test_dev_supports_io_poll_delay
+}
+
+fallback_device() {
+	if ! _configure_null_blk nullb1 power=1; then
+		return 1
+	fi
+	echo /dev/nullb1
+}
+
+cleanup_fallback_device() {
+	_exit_null_blk
+}
+
+run_fio_job() {
+	local test_dev_bs
+
+	test_dev_bs=$(_min_io "$TEST_DEV")
+	if _test_dev_is_rotational; then
+		size="32m"
+	else
+		size="1g"
+	fi
+
+	_fio_perf --bs="$test_dev_bs" --rw=randread --norandommap --name=reads \
+		--filename="$TEST_DEV" --size="$size" --direct=1 \
+		--ioengine=pvsync2 --hipri="$1"
+}
+
+test_device() {
+	echo "Running ${TEST_NAME}"
+
+	_divide_timeout 4
+	FIO_PERF_FIELDS=("read iops" "read lat mean" "system cpu")
+
+	# no polling, run job
+	FIO_PERF_PREFIX="no poll "
+	run_fio_job 0
+
+	# turn on polling, switch to classic, run job
+	FIO_PERF_PREFIX="classic poll "
+	_test_dev_queue_set io_poll_delay -1
+	run_fio_job 1
+
+	# switch to auto-hybrid polling, run job
+	_test_dev_queue_set io_poll_delay 0
+	if [[ $(_test_dev_queue_get io_poll_delay) == '0' ]]; then
+		FIO_PERF_PREFIX="auto hybrid poll "
+		run_fio_job 1
+	fi
+
+	# switch to explicit delay polling, run job
+	_test_dev_queue_set io_poll_delay 4
+	if [[ $(_test_dev_queue_get io_poll_delay) == '4' ]]; then
+		FIO_PERF_PREFIX="fixed hybrid poll "
+		run_fio_job 1
+	fi
+
+	echo "Test complete"
+}

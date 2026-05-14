@@ -1,0 +1,61 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2024 Chaitanya Kulkarni
+#
+# Test NVMe-PCI timeout with FIO jobs by triggering the nvme_timeout function.
+#
+
+. tests/nvme/rc
+
+DESCRIPTION="test nvme-pci timeout with fio jobs"
+CAN_BE_ZONED=1
+
+#restrict test to nvme-pci only
+nvme_trtype=pci
+
+requires() {
+	_have_fio
+	_nvme_requires
+	_have_kernel_options FAIL_IO_TIMEOUT FAULT_INJECTION_DEBUG_FS
+}
+
+test_device() {
+	local nvme_ns
+	local pdev
+	local i
+
+	echo "Running ${TEST_NAME}"
+
+	pdev=$(_get_pci_dev_from_blkdev)
+	nvme_ns="$(basename "${TEST_DEV}")"
+	echo 1 > /sys/block/"${nvme_ns}"/io-timeout-fail
+
+	echo 100 > /sys/kernel/debug/fail_io_timeout/probability
+	echo   1 > /sys/kernel/debug/fail_io_timeout/interval
+	echo  -1 > /sys/kernel/debug/fail_io_timeout/times
+	echo   0 > /sys/kernel/debug/fail_io_timeout/space
+	echo   1 > /sys/kernel/debug/fail_io_timeout/verbose
+
+	fio --bs=4k --rw=randread --norandommap --numjobs="$(nproc)" \
+	    --name=reads --direct=1 --filename="${TEST_DEV}" --group_reporting \
+	    --time_based --runtime=1m >& "$FULL"
+
+	if grep -q "Input/output error" "$FULL"; then
+		echo "Test complete"
+	else
+		echo "Test failed"
+	fi
+
+	# Remove and rescan the NVME device to ensure that it has come back
+	echo 1 > "/sys/bus/pci/devices/${pdev}/remove"
+	echo 1 > /sys/bus/pci/rescan
+	for ((i = 0; i < 10; i++)); do
+		if [[ -b ${TEST_DEV} ]]; then
+			break
+		fi
+		sleep .5
+	done
+	if (( i >= 10 )); then
+		echo "Failed to restore ${TEST_DEV}"
+	fi
+}

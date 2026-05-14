@@ -1,0 +1,44 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2023 Western Digital Corporation or its affiliates.
+#
+# scsi_debug helper functions.
+
+_test_dev_is_dm() {
+	[[ -r "${TEST_DEV_SYSFS}/dm/name" ]]
+}
+
+# Get device file path from the device ID "major:minor".
+_get_dev_path_by_id() {
+	for d in /sys/block/* /sys/block/*/*; do
+		if [[ ! -r "${d}/dev" ]]; then
+			continue
+		fi
+		if [[ "${1}" == "$(<"${d}/dev")" ]]; then
+			echo "/dev/${d##*/}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+_dm_destination_dev_set_scheduler() {
+	local dest_dev_id dest_dev path
+
+	while read -r dest_dev_id; do
+		if ! dest_dev=$(_get_dev_path_by_id "${dest_dev_id}"); then
+			continue
+		fi
+		path=${dest_dev/dev/sys\/block}/queue/scheduler
+		if [[ ! -w ${path} ]]; then
+			echo "Can not set scheduler of device mapper destination: ${dest_dev}"
+			continue
+		fi
+		if [[ ${SYSFS_QUEUE_SAVED["$path"]-unset} == unset ]]; then
+			SYSFS_QUEUE_SAVED["$path"]="$(sed \
+					-e 's/.*\[//' -e 's/\].*//' "${path}")"
+		fi
+		echo "${1}" > "${path}"
+	done < <(dmsetup table "$(<"${TEST_DEV_SYSFS}/dm/name")" |
+			 sed -n  's/.* \([0-9]*:[0-9]*\).*/\1/p')
+}

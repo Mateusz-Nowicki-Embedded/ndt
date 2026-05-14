@@ -1,0 +1,1 @@
+KERNEL=="cuse", GROUP="cuse", OPTIONS+="static_node=cuse"

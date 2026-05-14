@@ -1,0 +1,52 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2023 SUSE LLC
+#
+# Test if the fabrics transports are handling different queues types correctly.
+
+. tests/nvme/rc
+. common/xfs
+
+DESCRIPTION="test different queue types for fabric transports"
+
+requires() {
+	_nvme_requires
+	_have_xfs
+	_have_fio
+	_require_nvme_trtype tcp rdma
+	_have_kver 4 21
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	_setup_nvmet
+
+	local ns
+	local rand_io_size
+
+	_nvmet_target_setup
+
+	_nvme_connect_subsys --nr-write-queues 1
+
+	ns=$(_find_nvme_ns "${def_subsys_uuid}")
+
+	rand_io_size="$(_nvme_calc_rand_io_size 4M)"
+	_run_fio_rand_io --filename="/dev/${ns}" --size="${rand_io_size}"
+
+	_nvme_disconnect_subsys >> "$FULL" 2>&1
+
+	_nvme_connect_subsys --nr-write-queues 1 --nr-poll-queues 1
+
+	_run_fio_rand_io --filename="/dev/${ns}" --size="${rand_io_size}"
+
+	_nvme_disconnect_subsys >> "$FULL" 2>&1
+
+	_nvmet_target_cleanup
+
+	echo "Test complete"
+}

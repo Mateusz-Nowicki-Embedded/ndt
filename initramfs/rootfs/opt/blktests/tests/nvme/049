@@ -1,0 +1,76 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2023 Kanchan Joshi, Samsung Electronics
+# Test exercising uring passthrough IO on nvme char device
+
+. tests/nvme/rc
+
+DESCRIPTION="basic test for uring-passthrough I/O on /dev/ngX"
+QUICK=1
+
+requires() {
+	_nvme_requires
+	_have_kernel_option IO_URING
+	_have_kver 6 1
+	_have_fio_ver 3 33
+}
+
+metadata_bytes_per_4k_io() {
+	local phys_bs md_bytes
+
+	phys_bs=$(<"${TEST_DEV_SYSFS}"/queue/physical_block_size)
+	md_bytes=$(<"${TEST_DEV_SYSFS}"/metadata_bytes)
+
+	echo $((4096 * md_bytes / phys_bs))
+}
+
+test_device() {
+	echo "Running ${TEST_NAME}"
+
+	local ngdev=${TEST_DEV/nvme/ng}
+	local test_dev_bs
+	local target_size=4096
+	local common_args=()
+	local fio_output
+	local md_io_bytes
+
+	test_dev_bs=$(_min_io "$ngdev")
+	common_args=(
+		--size=1M
+		--filename="$ngdev"
+		--bs="$test_dev_bs"
+		--rw=randread
+		--numjobs=1
+		--iodepth=16
+		--name=randread
+		--ioengine=io_uring_cmd
+		--cmd_type=nvme
+		--time_based
+		--runtime=2
+	)
+
+	md_io_bytes=$(metadata_bytes_per_4k_io)
+	((md_io_bytes)) && common_args+=(--md_per_io_size="${md_io_bytes}")
+
+	((test_dev_bs > target_size)) && target_size=$test_dev_bs
+
+	# check security permission
+	if ! fio_output=$(fio --name=check --bs="$test_dev_bs" --size="$target_size" --filename="$ngdev" \
+			    --rw=read --ioengine=io_uring_cmd 2>&1) &&
+			grep -q -e "Operation not permitted" \
+				-e "Permission denied" <<< "$fio_output"; then
+		SKIP_REASONS+=("IORING_OP_URING_CMD is not allowed for $ngdev")
+		return
+	fi
+
+	#plain read test
+	_run_fio "${common_args[@]}"
+
+	#read with iopoll
+	_run_fio "${common_args[@]}" --hipri
+
+	#read with fixedbufs
+	_run_fio "${common_args[@]}" --fixedbufs
+
+	echo "Test complete"
+}

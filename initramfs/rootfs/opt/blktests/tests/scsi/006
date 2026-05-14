@@ -1,0 +1,52 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2018 Omar Sandoval
+#
+# Test that changing the cache type on a SCSI disk succeeds. Regression test
+# for commit d772a65d8a6c ("Revert "scsi: core: avoid host-wide host_busy
+# counter for scsi_mq""). Without the revert, this test will hang.
+
+. tests/scsi/rc
+
+DESCRIPTION="toggle SCSI cache type"
+QUICK=1
+CAN_BE_ZONED=1
+
+device_requires() {
+	_require_test_dev_is_scsi_disk
+}
+
+test_device() {
+	echo "Running ${TEST_NAME}"
+
+	local cache_types=(
+		"write through"
+		"none"
+		"write back"
+		"write back, no read (daft)"
+	)
+	local cache_type_paths
+	local cache_type_path
+	local original_cache_type
+	local cache_type
+
+	cache_type_paths=("${TEST_DEV_SYSFS}"/device/scsi_disk/*/cache_type)
+	cache_type_path="${cache_type_paths[0]}"
+	original_cache_type="$(cat "$cache_type_path")"
+	for cache_type in "${cache_types[@]}"; do
+		echo "$cache_type"
+		# SAT requires Read Cache Disable always set to zero.
+		# Skip cache types which disable read cache for SATA drives.
+		_test_dev_is_sata && [[ $cache_type == none ]] ||
+			[[ $cache_type =~ "no read" ]] && continue
+		( echo "$cache_type" > "$cache_type_path" ) |& grep -v "Invalid argument"
+		if [[ ${PIPESTATUS[0]} -eq 0 ]]; then
+			# If setting the cache type succeeded, it should now
+			# contain the new cache type.
+			grep -Fxv "$cache_type" "$cache_type_path"
+		fi
+	done
+	( echo "$original_cache_type" > "$cache_type_path" ) |& grep -v "Invalid argument"
+
+	echo "Test complete"
+}

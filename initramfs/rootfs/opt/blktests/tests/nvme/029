@@ -1,0 +1,93 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2019 Ming Lei <ming.lei@redhat.com>
+#
+# Test userspace IO on NVMe loop device. Regression test for patch "block: fix
+# segment calculation for passthrough IO".
+
+. tests/nvme/rc
+
+DESCRIPTION="test userspace IO via nvme-cli read/write interface"
+QUICK=1
+
+requires() {
+	_nvme_requires
+	_have_loop
+	_require_nvme_trtype_is_fabrics
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test_user_io()
+{
+	local disk="$1"
+	local start=$2
+	local cnt=$3
+	local bs size img img1
+
+	bs="$(blockdev --getss "$disk")"
+	size=$((cnt * bs))
+	img="$(mktemp /tmp/blk_img_XXXXXX)"
+	img1="$(mktemp /tmp/blk_img_XXXXXX)"
+
+	dd if=/dev/urandom of="$img" bs="$bs" count="$cnt" status=none
+
+	((cnt--))
+
+	if ! nvme write --start-block="$start" --block-count="$cnt" \
+		--data-size="$size" --data="$img" "$disk"; then
+		return 1
+	fi
+	if ! nvme read --start-block="$start" --block-count="$cnt" \
+		--data-size="$size" --data="$img1" "$disk"; then
+		return 1
+	fi
+
+	diff -q -u "$img" "$img1"
+	local res=$?
+
+	rm -f "$img" "$img1"
+	return $res
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	_setup_nvmet
+
+	local reset_nr_hugepages=false
+
+	_nvmet_target_setup
+
+	_nvme_connect_subsys
+
+	# nvme-cli may fail to allocate linear memory for rather large IO buffers.
+	# Increase nr_hugepages to allow nvme-cli to try the linear memory allocation
+	# from HugeTLB pool.
+	if [[  -r /proc/sys/vm/nr_hugepages &&
+		       "$(cat /proc/sys/vm/nr_hugepages)" -eq 0 ]]; then
+		echo 20 > /proc/sys/vm/nr_hugepages
+		reset_nr_hugepages=true
+	fi
+
+	local dev
+	dev="/dev/$(_find_nvme_ns "${def_subsys_uuid}")"
+	test_user_io "$dev" 1 512 > "$FULL" 2>&1 || echo FAIL
+	test_user_io "$dev" 1 511 >> "$FULL" 2>&1 || echo FAIL
+	test_user_io "$dev" 1 513 >> "$FULL" 2>&1 || echo FAIL
+	test_user_io "$dev" 511 1024 >> "$FULL" 2>&1 || echo FAIL
+	test_user_io "$dev" 511 1023 >> "$FULL" 2>&1 || echo FAIL
+	test_user_io "$dev" 511 1025 >> "$FULL" 2>&1 || echo FAIL
+
+	if [[ ${reset_nr_hugepages} = true ]]; then
+		echo 0 > /proc/sys/vm/nr_hugepages
+	fi
+
+	_nvme_disconnect_subsys >> "$FULL" 2>&1
+
+	_nvmet_target_cleanup
+
+	echo "Test complete"
+}

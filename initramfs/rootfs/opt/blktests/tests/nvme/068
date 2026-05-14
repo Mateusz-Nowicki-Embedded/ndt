@@ -1,0 +1,89 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026 Mateusz Nowicki <mateusz.nowicki@posteo.net>
+#
+# Trigger an NVMe controller reset via sysfs while a fio randrw workload
+# keeps every CPU busy, then verify that the driver re-enumerates the
+# controller and its namespace.
+#
+# Completion-delay injection (e.g. through the QEMU monitor) is expected
+# to be applied externally during the 30 s window before the reset.
+
+. tests/nvme/rc
+
+# pci-only test
+nvme_trtype=pci
+
+DESCRIPTION="reset_controller under fio load - check re-enumeration"
+TIMED=1
+
+requires() {
+	_nvme_requires
+	_have_fio
+}
+
+device_requires() {
+	_require_test_dev_is_nvme_pci
+	_require_test_dev_is_not_nvme_multipath
+}
+
+test_device() {
+	local nvmedev nvmectrl state rc=0
+	local fio_pid
+
+	echo "Running ${TEST_NAME}"
+
+	nvmedev=$(basename "$TEST_DEV")		# e.g. nvme0n1
+	nvmectrl=${nvmedev%%n[0-9]*}		# e.g. nvme0
+
+	# Background fio: one randrw direct-I/O job per CPU keeps every
+	# submission queue busy.  Runtime is long enough to span the 30 s
+	# pre-reset window plus margin for reset/re-enumeration.
+	fio --name=stress \
+	    --filename="$TEST_DEV" \
+	    --ioengine=libaio --direct=1 \
+	    --rw=randrw --bs=4k --iodepth=32 \
+	    --numjobs="$(nproc)" \
+	    --time_based --runtime=90 \
+	    --continue_on_error=all \
+	    --group_reporting &> "$FULL" &
+	fio_pid=$!
+
+	sleep 30
+
+	if ! echo 1 > "/sys/class/nvme/${nvmectrl}/reset_controller"; then
+		echo "FAIL: writing reset_controller returned an error"
+		rc=1
+	fi
+
+	# Poll for re-enumeration: ctrl state -> live and namespace node
+	# back in /dev.
+	local timeout=30
+	while ((timeout > 0)); do
+		state=$(cat "/sys/class/nvme/${nvmectrl}/state" 2>/dev/null || echo unknown)
+		if [[ "$state" == "live" && -b "$TEST_DEV" ]]; then
+			break
+		fi
+		sleep 1
+		timeout=$((timeout - 1))
+	done
+
+	if [[ "$state" != "live" ]]; then
+		echo "FAIL: controller state is '${state}' (expected 'live')"
+		rc=1
+	fi
+	if [[ ! -b "$TEST_DEV" ]]; then
+		echo "FAIL: namespace ${TEST_DEV} did not re-appear after reset"
+		rc=1
+	fi
+	if ! dd if="$TEST_DEV" of=/dev/null bs=4k count=1 iflag=direct \
+		&> /dev/null; then
+		echo "FAIL: post-reset read from ${TEST_DEV} failed"
+		rc=1
+	fi
+
+	{ kill "$fio_pid"; wait "$fio_pid"; } &> /dev/null
+
+	echo "Test complete"
+	return $rc
+}

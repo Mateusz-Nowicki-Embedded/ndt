@@ -1,0 +1,58 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2022 Sagi Grimberg <sagi@grimberg.me>
+#
+# Test nvme fabrics controller reset/disconnect/reconnect operation during I/O
+# This test is somewhat similar to test 032 but for fabrics controllers.
+
+. tests/nvme/rc
+
+DESCRIPTION="test nvme fabrics controller reset/disconnect operation during I/O"
+
+requires() {
+	_nvme_requires
+	_have_loop
+	_have_fio
+	_require_nvme_trtype_is_fabrics
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	_setup_nvmet
+
+	local nvmedev
+	local fio_pid
+	local ns
+
+	_nvmet_target_setup
+
+	_nvme_connect_subsys
+	nvmedev=$(_find_nvme_dev "${def_subsysnqn}")
+	ns=$(_find_nvme_ns "${def_subsys_uuid}")
+
+	# start fio job
+	echo "starting background fio"
+	_run_fio_rand_io --filename="/dev/${ns}" \
+		--group_reporting --ramp_time=5 \
+		--time_based --runtime=1d &> /dev/null &
+	fio_pid=$!
+	sleep 5
+
+	# do reset/remove operation
+	echo "resetting controller"
+	_nvme_reset_ctrl "${nvmedev}"
+	sleep 1
+	echo "deleting controller"
+	_nvme_delete_ctrl "${nvmedev}"
+
+	{ kill "${fio_pid}"; wait; } &> /dev/null
+
+	_nvmet_target_cleanup
+
+	echo "Test complete"
+}

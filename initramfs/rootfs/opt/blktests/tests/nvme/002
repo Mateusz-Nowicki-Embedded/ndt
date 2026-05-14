@@ -1,0 +1,53 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2018 Johannes Thumshirn
+#
+# Test nvme discovery with many subsystems so the discovery log page
+# exceeds 4k
+
+. tests/nvme/rc
+
+DESCRIPTION="create many subsystems and test discovery"
+
+requires() {
+	_nvme_requires
+	_have_loop
+	_require_nvme_trtype_is_loop
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	_setup_nvmet
+
+	local iterations=1000
+	local port
+	port="$(_create_nvmet_port)"
+
+	local loop_dev
+	loop_dev="$(losetup -f)"
+
+	local genctr=1
+
+	for ((i = 0; i < iterations; i++)); do
+		_create_nvmet_subsystem --subsysnqn "blktests-subsystem-$i" \
+					--blkdev "${loop_dev}"
+		_add_nvmet_subsys_to_port "${port}" "blktests-subsystem-$i"
+	done
+
+	genctr=$(_check_genctr "${genctr}" "$port" \
+			       "adding a subsystem to a port")
+
+	for ((i = iterations - 1; i >= 0; i--)); do
+		_remove_nvmet_subsystem_from_port "${port}" "blktests-subsystem-$i"
+		_remove_nvmet_subsystem "blktests-subsystem-$i"
+	done
+
+	_remove_nvmet_port "${port}"
+
+	echo "Test complete"
+}

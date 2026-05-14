@@ -1,0 +1,40 @@
+#!/bin/sh
+# PID 1 for the QEMU initramfs.
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+mount -t debugfs none /sys/kernel/debug
+mount -t tracefs none /sys/kernel/tracing 2>/dev/null || true
+
+# /dev/fd needed for bash <(...) process substitution
+ln -s /proc/self/fd /dev/fd 2>/dev/null
+ln -s /proc/self/fd/0 /dev/stdin 2>/dev/null
+ln -s /proc/self/fd/1 /dev/stdout 2>/dev/null
+ln -s /proc/self/fd/2 /dev/stderr 2>/dev/null
+
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export TERM=linux
+
+echo
+echo "=== nvme QEMU rootfs ==="
+echo "kernel: $(uname -r)"
+
+# Load NVMe driver via modprobe (resolves nvme-core dep automatically from modules.dep).
+#modprobe nvme && echo "[init] nvme loaded"
+
+# Start udev daemon (multi-call binary: systemd-udevd is a symlink to udevadm).
+# udev manages /dev nodes, populates /dev/disk/by-* links, settles after add events.
+mkdir -p /run/udev
+/usr/lib/systemd/systemd-udevd --daemon
+udevadm trigger --action=add --type=subsystems
+udevadm trigger --action=add --type=devices
+udevadm settle --timeout=10
+echo "[init] udev ready"
+
+echo "type 'poweroff -f' (or Ctrl+A x) to exit QEMU"
+echo
+
+exec /bin/sh

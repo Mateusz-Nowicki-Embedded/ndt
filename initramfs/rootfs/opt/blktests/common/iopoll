@@ -1,0 +1,31 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Jens Axboe
+#
+# I/O polling helper functions.
+
+. common/shellcheck
+
+_have_fio_with_poll() {
+	if ! _have_fio; then
+		return 1
+	fi
+	if ! fio --parse-only --name=test --ioengine=pvsync2 --hipri=1 1>/dev/null 2>&1; then
+		SKIP_REASONS+=("Fio does not support polling")
+		return 1
+	fi
+	return 0
+}
+
+_require_test_dev_supports_io_poll_delay() {
+	local old_io_poll_delay
+	if ! old_io_poll_delay="$(cat "${TEST_DEV_SYSFS}/queue/io_poll_delay" 2>/dev/null)"; then
+		SKIP_REASONS+=("kernel does not support hybrid polling")
+		return 1
+	fi
+	if ! echo "$old_io_poll_delay" >"${TEST_DEV_SYSFS}/queue/io_poll_delay" 2>/dev/null; then
+		SKIP_REASONS+=("$TEST_DEV does not support hybrid polling")
+		return 1
+	fi
+	return 0
+}
