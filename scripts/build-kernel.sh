@@ -6,6 +6,7 @@
 #   JOBS=8         override -j (default: nproc)
 #   CFG=<path>     override config (default: configs/linux-v<tag>.config)
 #   TARGETS=...    override make targets (default: "bzImage modules")
+#   CC=<path>      override compiler (default: scripts/gcc-c17 wrapper)
 
 set -euo pipefail
 
@@ -15,6 +16,10 @@ KSRC=$NDT/third_party/linux-fork
 BUILD=$NDT/build/linux
 JOBS=${JOBS:-$(nproc)}
 TARGETS=${TARGETS:-bzImage modules}
+# GCC 15 defaults to C23 where false/true/bool are keywords; kernels <=v6.9
+# define them as enum/typedef and won't build.  Wrap CC to force gnu17 in
+# every sub-Makefile (KCFLAGS alone misses subdirs with custom CFLAGS).
+CC=${CC:-$HERE/gcc-c17}
 
 if ! tag=$(git -C "$KSRC" describe --tags --exact-match HEAD 2>/dev/null); then
     echo "[build-kernel] error: third_party/linux-fork is not at a tagged commit" >&2
@@ -36,10 +41,12 @@ echo "[build-kernel] output:  ${BUILD#$NDT/}"
 echo "[build-kernel] jobs:    $JOBS"
 echo "[build-kernel] targets: $TARGETS"
 
+echo "[build-kernel] cc:      $CC"
+
 mkdir -p "$BUILD"
 cp "$CFG" "$BUILD/.config"
-make -C "$KSRC" O="$BUILD" olddefconfig
+make -C "$KSRC" O="$BUILD" CC="$CC" olddefconfig
 # shellcheck disable=SC2086
-make -C "$KSRC" O="$BUILD" -j"$JOBS" $TARGETS
+make -C "$KSRC" O="$BUILD" CC="$CC" -j"$JOBS" $TARGETS
 
 echo "[build-kernel] done: $BUILD/arch/x86/boot/bzImage"
