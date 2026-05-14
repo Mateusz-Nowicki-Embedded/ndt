@@ -20,6 +20,9 @@ exercise and validate the kernel's NVMe driver.
   across most runs and do not need to be rebuilt for every test.
 - `build-all.sh` — top-level wrapper that rebuilds kernel, QEMU,
   blktests, nvme-cli, and finally the initramfs image.
+- `configs/` — per-kernel-version `.config` files
+  (`linux-v6.9.config`, `linux-v7.0.config`, ...) consumed by
+  `build-kernel.sh`.
 - `scripts/`
   - `build-kernel.sh`, `build-qemu.sh`, `build-blktests.sh`,
     `build-nvme-cli.sh`, `build-initramfs.sh` — per-component builds
