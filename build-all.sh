@@ -18,4 +18,5 @@ NDT=$(cd "$(dirname "$0")" && pwd)
 "$NDT/scripts/build-qemu.sh"
 "$NDT/scripts/build-blktests.sh"
 "$NDT/scripts/build-nvme-cli.sh"
+"$NDT/scripts/build-pcimem.sh"
 "$NDT/scripts/build-initramfs.sh"

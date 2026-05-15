@@ -11,3 +11,7 @@
 	path = third_party/linux-fork
 	url = git@github.com:Mateusz-Nowicki-Embedded/linux-fork.git
 	shallow = true
+[submodule "third_party/pcimem"]
+	path = third_party/pcimem
+	url = https://github.com/billfarrow/pcimem.git
+	shallow = true

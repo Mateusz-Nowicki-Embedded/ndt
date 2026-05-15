@@ -16,10 +16,11 @@ NDT=$(cd "$HERE/.." && pwd)
 KBUILD=$NDT/build/linux
 NVMECLI=$NDT/build/nvme-cli
 BLKTESTS=$NDT/build/blktests
+PCIMEM=$NDT/build/pcimem
 ROOTFS=$NDT/initramfs/rootfs
 CPIO=$NDT/initramfs/initramfs.cpio.gz
 
-for d in "$KBUILD" "$NVMECLI" "$BLKTESTS"; do
+for d in "$KBUILD" "$NVMECLI" "$BLKTESTS" "$PCIMEM"; do
     if [[ ! -d "$d" ]]; then
         echo "[build-initramfs] missing: $d" >&2
         echo "[build-initramfs] hint: run ./build-all.sh first" >&2
@@ -59,6 +60,10 @@ mkdir -p "$ROOTFS/usr/lib64"
 rm -f "$ROOTFS/usr/lib64/libnvme.so"*
 install -m 755 "$NVMECLI/libnvme/src/libnvme.so.3.0.0" "$ROOTFS/usr/lib64/"
 ln -s libnvme.so.3.0.0 "$ROOTFS/usr/lib64/libnvme.so.3"
+
+# 2b. pcimem — direct mmap-based BAR poke (MSI-X mask manipulation etc.)
+echo "[build-initramfs] stage pcimem"
+install -D -m 755 "$PCIMEM/pcimem" "$ROOTFS/usr/local/bin/pcimem"
 
 # 3. blktests source + helpers
 echo "[build-initramfs] stage blktests"
