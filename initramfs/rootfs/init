@@ -37,6 +37,12 @@ echo "[init] udev ready"
 # NDT test mode: run a single blktests case if ndt_test=<id> is on the kernel
 # cmdline (e.g. ndt_test=nvme/068), then power off so the host sees QEMU exit.
 ndt_test=$(awk -v RS=' ' -F= '/^ndt_test=/{print $2}' /proc/cmdline | tr -d '\n')
+# Optional: inner-iter count exported as $NDT_INNER_ITER for tests
+# that loop reset scenarios inside one ./check invocation (e.g. 068).
+ndt_inner_iter=$(awk -v RS=' ' -F= '/^ndt_inner_iter=/{print $2}' /proc/cmdline | tr -d '\n')
+if [ -n "$ndt_inner_iter" ]; then
+    export NDT_INNER_ITER=$ndt_inner_iter
+fi
 if [ -n "$ndt_test" ]; then
     echo "=== NDT_BEGIN test=$ndt_test ==="
     modprobe nvme
@@ -44,21 +50,55 @@ if [ -n "$ndt_test" ]; then
     # warning here so it doesn't land mid-test (nvme/039 last_dmesg | tail -2
     # would otherwise lose a real error line to this noise).
     cat /sys/block/*/capability > /dev/null 2>&1 || true
+
+    # Hand control back to the host so it can program things that only make
+    # sense once the driver has created I/O queues — e.g. per-SQ completion
+    # delay via the QEMU monitor.  The host reads this sentinel from the
+    # console socket, runs whatever HMP commands it wants, then writes a
+    # line to /dev/ttyS1 to release us.  The line content is not parsed
+    # today (any line unblocks); future commands can be added here.
+    echo "=== NDT_PHASE phase='ready-for-cmd' ==="
+    read -r _ctrl_line < /dev/ttyS1 || true
+    echo "=== NDT_PHASE phase='running' ==="
+
     cd /opt/blktests
     ./check "$ndt_test"
-    # Result file lives at results/<dev_name>/<test_name>, e.g. results/nvme0n2/nvme/032.
-    result_file=""
+    # blktests writes one result file per TEST_DEV — e.g. with
+    # TEST_DEVS=(nvme0n2 nvme0n3) both results/nvme0n2/nvme/068 and
+    # results/nvme0n3/nvme/068 are produced.  Aggregation rules:
+    #   - any per-device "fail" wins   -> overall fail (with that reason)
+    #   - else if any device passed    -> overall pass
+    #   - else (all skipped/not run)   -> overall "not run"
+    # blktests result format is TAB-separated: "<key>\t<value>"; values may
+    # contain spaces (e.g. "not run").
+    any_pass=0; any_fail=0; fail_reason=; skip_reason=
     for d in results/*/; do
-        if [ -f "${d}${ndt_test}" ]; then
-            result_file="${d}${ndt_test}"
-            break
-        fi
+        f="${d}${ndt_test}"
+        [ -f "$f" ] || continue
+        s=$(sed -n 's/^status\t//p' "$f" | head -1)
+        r=$(sed -n 's/^reason\t//p' "$f" | head -1)
+        case "$s" in
+            pass)
+                any_pass=1
+                ;;
+            "not run"|skipped|"")
+                [ -z "$skip_reason" ] && skip_reason="$r"
+                ;;
+            *)
+                any_fail=1
+                [ -z "$fail_reason" ] && fail_reason="$r"
+                ;;
+        esac
     done
-    # blktests result file is TAB-separated: "<key>\t<value>".  Values may
-    # contain spaces (e.g. "not run"), so take everything after the first tab.
-    if [ -n "$result_file" ]; then
-        result_status=$(sed -n 's/^status\t//p' "$result_file" | head -1)
-        result_reason=$(sed -n 's/^reason\t//p' "$result_file" | head -1)
+    if [ "$any_fail" = 1 ]; then
+        result_status=fail
+        result_reason=$fail_reason
+    elif [ "$any_pass" = 1 ]; then
+        result_status=pass
+        result_reason=
+    else
+        result_status="not run"
+        result_reason=$skip_reason
     fi
     echo "=== NDT_STATUS status='${result_status:-unknown}' reason='${result_reason:-}' ==="
     # dmesg only on non-pass: spares serial bandwidth and host console log.

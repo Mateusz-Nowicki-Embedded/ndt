@@ -2,6 +2,11 @@
 # Boot the locally-built kernel + initramfs in QEMU with a virtual NVMe controller.
 # Console is wired to stdio (serial). Exit with: poweroff -f  (or Ctrl+A x).
 #
+# Three host-side sockets are created (server, nowait — host connects later):
+#   /tmp/qemu-serial.sock   ttyS0 console (kernel + init log, NDT sentinels)
+#   /tmp/qemu-ctrl.sock     ttyS1 control channel (host -> guest "GO" gate)
+#   /tmp/qemu-monitor.sock  HMP monitor (host -> QEMU: nvme_completion_delay, ...)
+#
 # Paths (relative to the NDT repo root):
 #   build/linux/arch/x86/boot/bzImage  -> kernel image
 #   initramfs/initramfs.cpio.gz        -> busybox initramfs (tracked binary)
@@ -77,6 +82,7 @@ exec "$QEMU_BIN" \
     -m 1G \
     -smp 8 \
     -serial unix:/tmp/qemu-serial.sock,server,nowait \
+    -serial unix:/tmp/qemu-ctrl.sock,server,nowait \
     -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
     -display none \
     -no-reboot \
