@@ -1,5 +1,0 @@
-fs/configfs/configfs.o
-drivers/pci/pcie/aer_inject.o
-drivers/nvme/host/nvme-core.o
-drivers/nvme/host/nvme.o
-drivers/thermal/intel/x86_pkg_temp_thermal.o

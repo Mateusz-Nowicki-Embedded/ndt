@@ -9,12 +9,17 @@
 #
 # After all builds finish, build-initramfs.sh repacks initramfs/rootfs +
 # the freshly built binaries into initramfs/initramfs.cpio.gz.
+#
+# NVMe namespaces are provided by the in-guest nvmet-pci-sw + null_blk
+# stack (see initramfs/rootfs/init), so there is no per-NS disk image
+# to materialise here any more.
 
 set -euo pipefail
 NDT=$(cd "$(dirname "$0")" && pwd)
+export NDT
 
-# TODO: implement individual build scripts and wire them up here.
 "$NDT/scripts/build-kernel.sh"
+"$NDT/scripts/build-nvmet-pci-sw.sh"
 "$NDT/scripts/build-qemu.sh"
 "$NDT/scripts/build-blktests.sh"
 "$NDT/scripts/build-nvme-cli.sh"

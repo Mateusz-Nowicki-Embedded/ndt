@@ -15,7 +15,7 @@ NDT=$(cd "$HERE/.." && pwd)
 KSRC=$NDT/third_party/linux-fork
 BUILD=$NDT/build/linux
 JOBS=${JOBS:-$(nproc)}
-TARGETS=${TARGETS:-bzImage modules}
+TARGETS=${TARGETS:-bzImage modules scripts_gdb}
 # GCC 15 defaults to C23 where false/true/bool are keywords; kernels <=v6.9
 # define them as enum/typedef and won't build.  Wrap CC to force gnu17 in
 # every sub-Makefile (KCFLAGS alone misses subdirs with custom CFLAGS).

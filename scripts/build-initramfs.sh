@@ -44,9 +44,47 @@ mkdir -p "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/host"
 cp "$KBUILD/drivers/nvme/host/nvme-core.ko" \
    "$KBUILD/drivers/nvme/host/nvme.ko" \
    "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/host/"
+
+# nvmet target stack (only stage what's actually built).
+NVMET_KO=$KBUILD/drivers/nvme/target/nvmet.ko
+if [[ -f "$NVMET_KO" ]]; then
+    mkdir -p "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/target"
+    cp "$NVMET_KO" "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/target/"
+    for opt in nvme-loop.ko nvmet-tcp.ko nvmet-rdma.ko nvmet-fc.ko; do
+        [[ -f "$KBUILD/drivers/nvme/target/$opt" ]] && \
+            cp "$KBUILD/drivers/nvme/target/$opt" \
+               "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/target/"
+    done
+fi
+
+# null_blk backing for nvmet namespaces.
+NULL_BLK_KO=$KBUILD/drivers/block/null_blk/null_blk.ko
+[[ -f "$NULL_BLK_KO" ]] || NULL_BLK_KO=$KBUILD/drivers/block/null_blk.ko
+if [[ -f "$NULL_BLK_KO" ]]; then
+    mkdir -p "$ROOTFS/lib/modules/$KVER/kernel/drivers/block"
+    cp "$NULL_BLK_KO" "$ROOTFS/lib/modules/$KVER/kernel/drivers/block/"
+fi
+
+# configfs (nvmet's port/subsys/namespace API is configfs-only).
+CONFIGFS_KO=$KBUILD/fs/configfs/configfs.ko
+if [[ -f "$CONFIGFS_KO" ]]; then
+    mkdir -p "$ROOTFS/lib/modules/$KVER/kernel/fs/configfs"
+    cp "$CONFIGFS_KO" "$ROOTFS/lib/modules/$KVER/kernel/fs/configfs/"
+fi
 for f in modules.order modules.builtin modules.builtin.modinfo; do
     [[ -f "$KBUILD/$f" ]] && cp "$KBUILD/$f" "$ROOTFS/lib/modules/$KVER/"
 done
+
+# Out-of-tree nvmet-pci-sw module — software NVMe PCIe endpoint.
+NPS_KO=$NDT/third_party/nvmet-pci-sw/nvmet-pci-sw.ko
+if [[ -f "$NPS_KO" ]]; then
+    mkdir -p "$ROOTFS/lib/modules/$KVER/extra"
+    cp "$NPS_KO" "$ROOTFS/lib/modules/$KVER/extra/"
+    echo "[build-initramfs] stage out-of-tree: nvmet-pci-sw.ko"
+else
+    echo "[build-initramfs] warn: $NPS_KO not built, skipping" >&2
+fi
+
 depmod -b "$ROOTFS" "$KVER"
 
 # blktests' _have_kernel_options runs zgrep on /proc/config.gz (exposed by
@@ -71,9 +109,8 @@ rm -rf "$ROOTFS/opt/blktests"
 mkdir -p "$ROOTFS/opt"
 rsync -a --exclude='.git*' "$BLKTESTS/" "$ROOTFS/opt/blktests/"
 cat > "$ROOTFS/opt/blktests/config" <<'EOF'
-# nvme0n2: 256 MiB, no metadata (default test target for most tests).
-# nvme0n3: 256 MiB, ms=8 mset=0 (metadata-formatted, exercises nvme/064).
-TEST_DEVS=(/dev/nvme0n2 /dev/nvme0n3)
+# nvmet-pci-sw exposes a single namespace backed by /dev/nullb0.
+TEST_DEVS=(/dev/nvme0n1)
 # Unprivileged user used by tests like nvme/046; see initramfs/rootfs/etc/passwd.
 NORMAL_USER=nobody
 EOF

@@ -26,5 +26,7 @@ if [[ ! -S "$SOCK" ]]; then
     exit 1
 fi
 
-# -u: unidirectional (write only); we don't read anything back from ttyS1.
-printf '%s\n' "$*" | socat -u - "UNIX-CONNECT:$SOCK"
+# Bidirectional with a 1-second linger after EOF so QEMU has time to deliver
+# the buffered data to the guest tty before the socket closes.  Plain "-u"
+# closes too aggressively and the line can be discarded by QEMU's chardev.
+printf '%s\n' "$*" | socat -t 1 - "UNIX-CONNECT:$SOCK" > /dev/null

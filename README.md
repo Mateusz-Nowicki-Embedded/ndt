@@ -2,44 +2,47 @@
 
 A test harness for the Linux NVMe driver.
 
-`ndt` is a wrapper repository that ties together the components used to
-exercise and validate the kernel's NVMe driver.
+NDT boots a locally built kernel under QEMU, brings up the
+[`nvmet-pci-sw`](third_party/nvmet-pci-sw/) software NVMe endpoint inside
+the guest (no QEMU-emulated NVMe device), and drives blktests +
+scenario scripts against the resulting `/dev/nvme0n1`.
 
 ## Layout
 
-- `third_party/` — submodules pointing at the moving pieces:
+- `third_party/` — submodules:
   - `linux-fork` — Linux kernel fork, pinned at the tested version.
-  - `qemu-nvme` — fork of QEMU with NVMe-focused monitor commands and
-    fault-injection hooks used to drive the virtual controller.
-  - `nvme-cli-fork` — fork of `nvme-cli` used inside the guest to issue
-    admin / I/O commands and read controller state.
-  - `blktests-fork` — fork of `blktests` carrying the NVMe driver test
-    cases run inside the guest.
+  - `nvmet-pci-sw` — software NVMe PCIe endpoint built as an
+    out-of-tree module against `linux-fork`; provides the
+    `/dev/nvme0n1` the tests run against.
+  - `qemu-nvme` — fork of QEMU.  Carries custom HMP NVMe knobs from
+    the old QEMU-emul era; today NDT uses it as a plain
+    `qemu-system-x86_64` (no `-device nvme`).
+  - `nvme-cli-fork` — `nvme-cli` used inside the guest to issue admin
+    / I/O commands.
+  - `blktests-fork` — `blktests` checkout with NDT-specific test
+    cases (e.g. `nvme/068`, `nvme/069`).
+  - `pcimem` — `mmap`-based BAR poke tool used by some tests to
+    manipulate MSI-X mask bits directly.
 - `initramfs/` — guest root filesystem source (`rootfs/`) and the
-  prebuilt `initramfs.cpio.gz` shipped in git.  Contents are stable
-  across most runs and do not need to be rebuilt for every test.
-- `build-all.sh` — top-level wrapper that rebuilds kernel, QEMU,
-  blktests, nvme-cli, and finally the initramfs image.
+  prebuilt `initramfs.cpio.gz`.  PID 1 is `rootfs/init`: brings up
+  `null_blk + nvmet + nvmet-pci-sw`, then sits on a `ttyS1` command
+  loop (RUN / EXEC / GO / DMESG / EXIT) driven by the host.
+- `build-all.sh` — top-level wrapper: kernel → nvmet-pci-sw → QEMU
+  → blktests → nvme-cli → pcimem → initramfs.
 - `configs/` — per-kernel-version `.config` files
-  (`linux-v6.9.config`, `linux-v7.0.config`, ...) consumed by
-  `build-kernel.sh`.
+  (`linux-v7.0.config` debug, `linux-v7.0-perf.config` perf).
 - `scripts/`
-  - `build-kernel.sh`, `build-qemu.sh`, `build-blktests.sh`,
-    `build-nvme-cli.sh`, `build-initramfs.sh` — per-component builds
-    invoked by `build-all.sh`.
-  - `run-qemu.sh` — boots the locally built kernel + initramfs in QEMU.
-    Opens three host-side sockets: serial console (`ttyS0`), guest
-    control channel (`ttyS1`), and HMP monitor.
-  - `qemu-hmp.sh` — one-shot HMP command sender (writes to the monitor
-    socket, prints the reply).  Used by `ndt.sh` to program e.g.
-    `nvme_completion_delay`.
-  - `qemu-ctrl.sh` — pushes a line into the guest's `ttyS1` control
-    channel; releases the init script's "ready-for-cmd" gate.
-  - `refresh-nvme-mod.sh` — narrow loop: rebuild just the NVMe modules
-    and repack the cpio.
+  - `build-*.sh` — per-component builds invoked by `build-all.sh`.
+  - `run-qemu.sh` — boots kernel + initramfs in QEMU with two
+    server sockets: `ttyS0` (`/tmp/qemu-serial.sock`) and `ttyS1`
+    (`/tmp/qemu-ctrl.sock`).
+  - `qemu-ctrl.sh` — pushes a line into `ttyS1` (releases the
+    `ready-for-cmd` gate, sends RUN / EXEC commands).
+  - `refresh-nvme-mod.sh` — narrow loop: rebuild just the NVMe
+    modules and repack the cpio.
+- `tests/` — host-side scenario scripts (`NNN-name.sh`) driven by
+  `ndt.sh`.  Sourced helper library: `tests/lib/scenario.sh`.
 - `build/` *(gitignored)* — populated by the build scripts.
-- `disks/` *(gitignored)* — NVMe namespace images for the QEMU device.
-
 
 ## Getting the sources
 
@@ -53,29 +56,27 @@ If you already cloned without `--recurse-submodules`:
 git submodule update --init --recursive
 ```
 
-## What NDT does
+## What ndt does
 
-NDT drives a single blktests case end-to-end against the NVMe driver
-running inside QEMU.  The entry point is a bash script that takes a
-test identifier (e.g. `nvme/068`) and:
+`ndt.sh` runs scenario scripts from `tests/NNN-name.sh` under QEMU.
+Each (test × iteration) gets its own fresh QEMU session and a dedicated
+artifact directory under `/tmp/ndt/<run-id>/`.
 
-1. boots `qemu-nvme` with an emulated NVMe controller,
-2. waits for the guest's `NDT_PHASE ready-for-cmd` sentinel
-   (driver loaded, I/O queues created),
-3. programs anything requested via the HMP monitor — currently
-   per-SQ `nvme_completion_delay`,
-4. releases the guest gate (`GO` on `ttyS1`) so the test starts,
-5. captures the test's exit status and output,
-6. shuts the guest down cleanly,
-7. prints a single `PASS` / `FAIL` line plus the captured log.
+For each iteration:
 
-Usage sketch:
+1. boots a fresh QEMU,
+2. `rootfs/init` modprobes `null_blk + nvmet + nvmet-pci-sw`, opens
+   the configfs subsystem + port, waits for `/dev/nvme0n1`, then
+   emits `NDT_PHASE ready-for-cmd`,
+3. the host scenario script drives the guest via `ttyS1`
+   (`run_blktest`, `exec_in_guest`, `dmesg_dump`, ...),
+4. scenario writes its verdict (`scenario_pass` / `scenario_fail`),
+5. the runner shuts the guest down and records `PASS` / `FAIL`.
+
+Usage:
 
 ```sh
-./ndt.sh nvme/068
-./ndt.sh 32 cq-delay=1:1000           # delay SQ 1 by 1 s before the test
-./ndt.sh t=32,50 i=4 --stop-at-fail   # multi-test loop, abort on first fail
+./ndt.sh --test=1                       # single scenario, 1 iter
+./ndt.sh --test=40,55 --iteration=10    # batched: each test 10× back-to-back
+./ndt.sh --test=1 -i 10 --stop-at-fail  # abort whole run on first FAIL
 ```
-
-The intent is that CI and local "did I break the driver?" loops both
-go through the same one-liner.

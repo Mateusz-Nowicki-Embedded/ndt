@@ -1,280 +1,335 @@
 #!/bin/bash
-# NVMe Driver Tester — run blktests cases under QEMU and report PASS/FAIL.
+# NVMe Driver Tester — runs scenario scripts from tests/NN-name.sh under QEMU.
 #
 # Usage:
-#   ./ndt.sh 32                       # single test
-#   ./ndt.sh nvme/032                 # full id form
-#   ./ndt.sh t=32,50                  # multiple tests in one iteration
-#   ./ndt.sh t=32,50 i=4              # 32 then 50, repeated 4 iterations (8 runs)
-#   ./ndt.sh 32 50 i=2                # positional + named, equivalent to t=32,50 i=2
-#   ./ndt.sh t=32,50 i=4 --stop-at-fail   # abort the whole run on the first FAIL
+#   ./ndt.sh --test=1                       single scenario, 1 iter
+#   ./ndt.sh --test=1,2,71 --iteration=10   batched: each test 10× back-to-back
+#   ./ndt.sh --test=1 -i 10 --stop-at-fail  abort whole run on first FAIL
 #
-# Per-SQ artificial completion delay (forked QEMU only):
-#   ./ndt.sh 32 cq-delay=1:35000          # delay SQ 1 by 35 s before the test
-#   ./ndt.sh 32 cq-delay=1:1000 cq-delay=2:500   # multiple SQs
-# The delay is applied via HMP `nvme_completion_delay` after the driver has
-# created its I/O queues and before ./check runs the test, so the test sees
-# the configured delay from the first command.
+# Each (test × iter) gets its own fresh QEMU session and a dedicated artifact
+# directory under /tmp/ndt/<run-id>/test-NN-name/iter-NNN/:
 #
-# Inner iterations within ONE QEMU session (test-side cooperative):
-#   ./ndt.sh 68 inner-iter=3 cq-delay=0:5000
-# Requires the test to emit NDT_INNER_ITER sentinels and read /dev/ttyS1
-# (currently: nvme/068).  On every iter's 'ready' the host re-applies the
-# cq-delay (admin SQ is rebuilt by the previous reset with delay=0) and
-# releases the gate; on 'done|fail' the host moves on to the next iter.
-# Use this to check whether a reset affects subsequent ones in the same
-# controller lifetime.
+#   console.log     ttyS0 capture (kernel + initramfs + scenario sentinels)
+#   scenario.log    host-side scenario stdout/stderr
+#   qemu.log        QEMU process stdout/stderr
+#   verdict.txt     "PASS" or "FAIL: <reason>"
+#   dmesg.txt       (on FAIL) cooperative DMESG via the ttyS1 channel
 #
-# By default a FAIL does NOT abort the remaining runs — the loop continues so
-# you can see flake rates over multiple iterations.  --stop-at-fail flips that.
+# Symlink /tmp/ndt/latest points at the newest run-id.
+#
+# Test resolution: --test=N matches tests/NN-*.sh (zero-padded to 2 digits).
 #
 # Exit codes:
-#   0   all runs passed
-#   1   at least one run failed (or did not run cleanly)
+#   0   all iterations passed
+#   1   at least one FAIL
 #   2   bad arguments / setup error
-#
-# Per-run logs land in /tmp/ndt-console-<iter>-<sanitized-id>.log.
 
-set -euo pipefail
+set -uo pipefail
 
 NDT=$(cd "$(dirname "$0")" && pwd)
+export NDT
 
-# Print the leading comment block (everything from line 2 down to the first
-# non-comment line) on the requested stream, then exit with the given code.
 usage() {
     local rc=${1:-2} dest=${2:-2}
     awk 'NR==1{next} /^#/{sub(/^#[ \t]?/,""); print; next} {exit}' "$0" >&"$dest"
     exit "$rc"
 }
 
-[[ $# -lt 1 ]] && usage
+# --- arg parsing ------------------------------------------------------------
 
-tests=()
-iter=1
-inner_iter=1
+tests_csv=""
+iters=1
 stop_at_fail=0
-cq_delays=()
-
 for arg in "$@"; do
     case "$arg" in
-        -h|--help) usage 0 1 ;;
-        --stop-at-fail) stop_at_fail=1 ;;
-        i=*) iter="${arg#i=}" ;;
-        inner-iter=*) inner_iter="${arg#inner-iter=}" ;;
-        t=*) IFS=',' read -ra _add <<< "${arg#t=}"; tests+=("${_add[@]}") ;;
-        cq-delay=*)
-            spec="${arg#cq-delay=}"
-            if [[ ! "$spec" =~ ^[0-9]+:[0-9]+$ ]]; then
-                echo "[ndt] bad cq-delay spec: $spec (want <sqid>:<ms>)" >&2; usage
-            fi
-            cq_delays+=("$spec")
+        -h|--help)        usage 0 1 ;;
+        --stop-at-fail)   stop_at_fail=1 ;;
+        --test=*)         tests_csv="${arg#--test=}" ;;
+        -t)               echo "[ndt] use --test=N,M (= form)" >&2; usage ;;
+        --iteration=*)    iters="${arg#--iteration=}" ;;
+        -i)               echo "[ndt] use --iteration=N (= form)" >&2; usage ;;
+        *)                echo "[ndt] unknown arg: $arg" >&2; usage ;;
+    esac
+done
+
+[[ -z "$tests_csv" ]] && { echo "[ndt] --test=N required" >&2; usage; }
+if ! [[ "$iters" =~ ^[0-9]+$ ]] || (( iters < 1 )); then
+    echo "[ndt] bad --iteration: $iters" >&2; usage
+fi
+
+# --- test resolution --------------------------------------------------------
+
+declare -a tests_paths tests_names
+IFS=',' read -ra _nums <<< "$tests_csv"
+for n in "${_nums[@]}"; do
+    if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+        echo "[ndt] bad test number: $n" >&2; usage
+    fi
+    nn=$(printf '%03d' "$((10#$n))")
+    shopt -s nullglob
+    matches=( "$NDT/tests/$nn"-*.sh )
+    shopt -u nullglob
+    if (( ${#matches[@]} == 0 )); then
+        echo "[ndt] no test matches tests/$nn-*.sh" >&2; exit 2
+    elif (( ${#matches[@]} > 1 )); then
+        echo "[ndt] multiple matches for tests/$nn-*.sh: ${matches[*]}" >&2; exit 2
+    fi
+    tests_paths+=( "${matches[0]}" )
+    name=$(basename "${matches[0]}" .sh)
+    tests_names+=( "$name" )
+done
+
+# --- run-id + dir layout ----------------------------------------------------
+
+run_id=$(date +%Y%m%d-%H%M%S)-$$
+RUN_DIR=/tmp/ndt/$run_id
+mkdir -p "$RUN_DIR"
+ln -snf "$run_id" /tmp/ndt/latest
+
+{
+    echo "ndt run $run_id"
+    echo "args: $*"
+    if [[ -d "$NDT/third_party/linux-fork/.git" ]]; then
+        echo "linux-fork: $(git -C "$NDT/third_party/linux-fork" rev-parse --short HEAD 2>/dev/null)"
+    fi
+    if [[ -d "$NDT/third_party/blktests-fork/.git" ]]; then
+        echo "blktests-fork: $(git -C "$NDT/third_party/blktests-fork" rev-parse --short HEAD 2>/dev/null)"
+    fi
+} > "$RUN_DIR/args.txt"
+
+PANIC_RE='Kernel panic|kernel BUG at|Oops:|Unable to handle kernel|general protection fault|stack segment'
+
+# Parse the test file's `# ndt-expected:` header (pass|fail).  Defaults to
+# "pass" when absent.  Used by the runner to invert the summary verdict for
+# tests whose whole purpose is to produce a FAIL (e.g. 002-always-fail).
+parse_test_expected() {
+    local file=$1 val
+    val=$(awk '
+        NR > 1 && !/^#/ && !/^$/ { exit }
+        /^# ndt-expected:/ {
+            sub(/^# ndt-expected:[ \t]*/, "")
+            sub(/[ \t]+$/, "")
+            print; exit
+        }
+    ' "$file")
+    case "$val" in
+        pass|fail) printf '%s' "$val" ;;
+        "")        printf 'pass' ;;
+        *)
+            echo "[ndt] bad ndt-expected value '$val' in $file (use pass|fail)" >&2
+            return 1
             ;;
-        --*|*=*) echo "[ndt] unknown arg: $arg" >&2; usage ;;
-        *)   tests+=("$arg") ;;
     esac
-done
-
-if [[ ${#tests[@]} -eq 0 ]]; then
-    echo "[ndt] no tests given" >&2; usage
-fi
-if ! [[ "$iter" =~ ^[0-9]+$ ]] || (( iter < 1 )); then
-    echo "[ndt] bad iteration count: $iter" >&2; usage
-fi
-if ! [[ "$inner_iter" =~ ^[0-9]+$ ]] || (( inner_iter < 1 )); then
-    echo "[ndt] bad inner-iter: $inner_iter" >&2; usage
-fi
-
-# Normalize each id: bare number -> nvme/NNN, path stays.
-for k in "${!tests[@]}"; do
-    case "${tests[$k]}" in
-        */*) ;;
-        *)   tests[$k]="nvme/$(printf '%03d' "$((10#${tests[$k]}))")" ;;
-    esac
-done
-
-SERIAL_SOCK=/tmp/qemu-serial.sock
-CTRL_SOCK=/tmp/qemu-ctrl.sock
-MONITOR_SOCK=/tmp/qemu-monitor.sock
-QEMU_LOG=/tmp/ndt-qemu.log
-
-cleanup() {
-    [[ -n "${SOCAT_PID:-}" ]] && kill "$SOCAT_PID" 2>/dev/null || true
-    [[ -n "${QEMU_PID:-}"  ]] && kill "$QEMU_PID"  2>/dev/null || true
-}
-trap cleanup EXIT
-
-# Block until an ERE pattern appears in $1, or $2 seconds pass.  Returns
-# 0 on hit.  Polls the file because socat appends as the guest emits —
-# no inotify needed.  Uses -E so callers can write '(done|fail)' etc.
-wait_for_line() {
-    local file=$1 pattern=$2 timeout=${3:-30}
-    local deadline=$(( $(date +%s) + timeout ))
-    while (( $(date +%s) < deadline )); do
-        if [[ -f "$file" ]] && grep -Eq -- "$pattern" "$file"; then
-            return 0
-        fi
-        sleep 0.1
-    done
-    return 1
 }
 
-# Apply every cq-delay in $cq_delays via HMP, appending the chatter to
-# $hmp_log.  Safe to call multiple times (admin SQ delay is gone after
-# reset, so re-application is the standard idiom in inner-iter mode).
-apply_cq_delays() {
-    local hmp_log=$1 d sqid ms
-    for d in "${cq_delays[@]}"; do
-        sqid=${d%%:*}
-        ms=${d##*:}
-        echo "+ nvme_completion_delay $sqid $ms" >> "$hmp_log"
-        MONITOR_SOCK="$MONITOR_SOCK" \
-            "$NDT/scripts/qemu-hmp.sh" "nvme_completion_delay $sqid $ms" \
-            >> "$hmp_log" 2>&1 || true
-    done
-}
+# --- watcher subshell -------------------------------------------------------
+# Watches QEMU + console.log; if QEMU dies or kernel panic appears, kills the
+# scenario (SIGTERM) and writes the cause into $cause_file.  Exits silently
+# if the scenario completes first (happy path).
 
-# run_test <test_id> <console_log_path> -> 0 on PASS, 1 otherwise.
-# Sets $LAST_STATUS_LINE so caller can print it.
-LAST_STATUS_LINE=""
-run_test() {
-    local test_id=$1
-    local console=$2
-
-    rm -f "$console" "$SERIAL_SOCK" "$CTRL_SOCK" "$MONITOR_SOCK" "$QEMU_LOG"
-
-    local append="console=ttyS0 panic=-1 ndt_test=$test_id"
-    if (( inner_iter > 1 )); then
-        append="$append ndt_inner_iter=$inner_iter"
-    fi
-    APPEND="$append" \
-        "$NDT/scripts/run-qemu.sh" > "$QEMU_LOG" 2>&1 &
-    QEMU_PID=$!
-
-    # Wait for the console socket — drives all subsequent connect attempts.
-    local _w
-    for _w in $(seq 1 50); do
-        [[ -S "$SERIAL_SOCK" ]] && break
-        sleep 0.1
-    done
-    if [[ ! -S "$SERIAL_SOCK" ]]; then
-        LAST_STATUS_LINE="serial socket never appeared"
-        kill "$QEMU_PID" 2>/dev/null || true
-        QEMU_PID=""
-        return 1
-    fi
-
-    # Mirror console output to a log file we can grep for sentinels.
-    socat -u "UNIX-CONNECT:$SERIAL_SOCK" "OPEN:$console,creat,append" &
-    SOCAT_PID=$!
-
-    # Guest blocks on ttyS1 after announcing ready-for-cmd.  Wait for that.
-    if ! wait_for_line "$console" "NDT_PHASE phase='ready-for-cmd'" 60; then
-        LAST_STATUS_LINE="guest never reached ready-for-cmd (boot/modprobe failure?)"
-        return 1
-    fi
-
-    # HMP traffic stays in a sibling log — readline echoes a lot of noise
-    # and we don't want it polluting the console log we grep for sentinels.
-    local hmp_log="${console%.log}.hmp.log"
-    : > "$hmp_log"
-
-    # Single-iter mode: apply cq-delay once before kicking the test.
-    # Multi-iter mode: skip here, the test will hand control back per iter.
-    if (( inner_iter <= 1 )); then
-        apply_cq_delays "$hmp_log"
-    fi
-
-    CTRL_SOCK="$CTRL_SOCK" "$NDT/scripts/qemu-ctrl.sh" GO
-
-    # Multi-iter loop: for each round, wait for the test to announce
-    # 'ready', re-apply cq-delay (admin SQ was rebuilt by the previous
-    # reset with delay=0), release the gate with GO, wait for done|fail.
-    local ix inner_pass=0 inner_fail=0
-    if (( inner_iter > 1 )); then
-        for (( ix = 1; ix <= inner_iter; ix++ )); do
-            if ! wait_for_line "$console" \
-                "NDT_INNER_ITER iter=$ix phase='ready'" 120; then
-                LAST_STATUS_LINE="inner iter $ix never reached ready"
-                return 1
+launch_watcher() {
+    local console=$1 cause=$2 scenario_pid=$3 qemu_pid=$4
+    (
+        while kill -0 "$scenario_pid" 2>/dev/null; do
+            if ! kill -0 "$qemu_pid" 2>/dev/null; then
+                echo "qemu-died" > "$cause"
+                kill -TERM "$scenario_pid" 2>/dev/null
+                return 0
             fi
-            apply_cq_delays "$hmp_log"
-            CTRL_SOCK="$CTRL_SOCK" "$NDT/scripts/qemu-ctrl.sh" GO
-            # 'done' or 'fail' — give the iter generous time
-            # (fio runtime 30s + reset overhead with cq-delay).
-            if ! wait_for_line "$console" \
-                "NDT_INNER_ITER iter=$ix phase='(done|fail)'" 300; then
-                LAST_STATUS_LINE="inner iter $ix never finished"
-                return 1
+            if [[ -f "$console" ]] && grep -Eq -- "$PANIC_RE" "$console"; then
+                echo "panic" > "$cause"
+                kill -TERM "$scenario_pid" 2>/dev/null
+                return 0
             fi
-            if grep -q "NDT_INNER_ITER iter=$ix phase='fail'" "$console"; then
-                inner_fail=$((inner_fail + 1))
-            else
-                inner_pass=$((inner_pass + 1))
-            fi
+            sleep 1
         done
-    fi
-
-    wait "$QEMU_PID" 2>/dev/null || true
-    QEMU_PID=""
-    SOCAT_PID=""  # socat self-exits when QEMU drops the socket
-
-    if ! LAST_STATUS_LINE=$(grep -m 1 '=== NDT_STATUS ' "$console"); then
-        LAST_STATUS_LINE="NDT_STATUS sentinel not found"
-        return 1
-    fi
-    if (( inner_iter > 1 )); then
-        LAST_STATUS_LINE="$LAST_STATUS_LINE [inner: pass=$inner_pass fail=$inner_fail]"
-    fi
-
-    local status
-    status=$(sed -nE "s/.*status='([^']*)'.*/\1/p" <<<"$LAST_STATUS_LINE")
-    [[ "$status" == "pass" ]]
+    ) &
 }
 
-pass=0
-fail=0
-total=$(( ${#tests[@]} * iter ))
-current=0
+# --- per-iter execution -----------------------------------------------------
 
-if (( ${#cq_delays[@]} > 0 )); then
-    echo "[ndt] cq-delay: ${cq_delays[*]}"
-fi
+# run_iter <test-name> <test-path> <iter-num>
+# Returns: 0 PASS, 1 FAIL.  Writes $iter_dir/verdict.txt.
+run_iter() {
+    local name=$1 path=$2 iter=$3
+    local iter_dir="$RUN_DIR/$name/iter-$(printf '%03d' "$iter")"
+    mkdir -p "$iter_dir"
 
-for ((it=1; it<=iter; it++)); do
-    for test_id in "${tests[@]}"; do
-        current=$((current + 1))
-        log=/tmp/ndt-console-${it}-${test_id//\//_}.log
-        printf '[ndt] %d/%d  iter %d/%d  %-12s ... ' \
-            "$current" "$total" "$it" "$iter" "$test_id"
-        if run_test "$test_id" "$log"; then
-            pass=$((pass + 1))
-            echo "PASS"
+    local console=$iter_dir/console.log
+    local slog=$iter_dir/scenario.log
+    local qlog=$iter_dir/qemu.log
+    local verdict=$iter_dir/verdict.txt
+    local cause=$iter_dir/watcher-cause.txt
+
+    : > "$console"; : > "$slog"; : > "$qlog"
+    rm -f /tmp/qemu-serial.sock /tmp/qemu-ctrl.sock
+
+    APPEND="console=ttyS0 panic=0 memmap=64K\$0x100000000" \
+        "$NDT/scripts/run-qemu.sh" > "$qlog" 2>&1 &
+    local qemu_pid=$!
+
+    local _w
+    for _w in $(seq 1 100); do
+        [[ -S /tmp/qemu-serial.sock ]] && break
+        sleep 0.1
+    done
+    if [[ ! -S /tmp/qemu-serial.sock ]]; then
+        echo "FAIL: qemu never created serial socket" > "$verdict"
+        kill "$qemu_pid" 2>/dev/null
+        wait "$qemu_pid" 2>/dev/null
+        return 1
+    fi
+
+    socat -u "UNIX-CONNECT:/tmp/qemu-serial.sock" "OPEN:$console,creat,append" &
+    local socat_pid=$!
+
+    NDT_CONSOLE_LOG=$console \
+    NDT_VERDICT=$verdict \
+    NDT_ITER_DIR=$iter_dir \
+    NDT_CTRL_SOCK=/tmp/qemu-ctrl.sock \
+    NDT_QEMU_PID=$qemu_pid \
+    NDT=$NDT \
+        bash "$path" > "$slog" 2>&1 &
+    local scenario_pid=$!
+
+    launch_watcher "$console" "$cause" "$scenario_pid" "$qemu_pid"
+    local watcher_pid=$!
+
+    wait "$scenario_pid"
+    local scenario_rc=$?
+
+    kill "$watcher_pid" 2>/dev/null
+    wait "$watcher_pid" 2>/dev/null
+
+    # Determine final verdict
+    if [[ -s "$cause" ]]; then
+        local watcher_cause
+        watcher_cause=$(cat "$cause")
+        local watcher_msg
+        case "$watcher_cause" in
+            panic)     watcher_msg="kernel panic" ;;
+            qemu-died) watcher_msg="qemu died" ;;
+            *)         watcher_msg="$watcher_cause" ;;
+        esac
+        if [[ -s "$verdict" ]]; then
+            printf '; concurrent: %s\n' "$watcher_msg" >> "$verdict"
         else
-            fail=$((fail + 1))
-            echo "FAIL  ($LAST_STATUS_LINE)"
-            echo "       log: $log"
-            # blktests stdout between markers, with kernel timestamps filtered
-            # out — this is what shows skip reasons and .out diffs.
-            sed -n '/=== NDT_BEGIN/,/=== NDT_STATUS/p' "$log" \
-                | sed -e '1d;$d' \
-                | grep -v '^\[[ ]*[0-9]\+\.[0-9]\+\]' \
-                | tail -20 \
-                | sed 's/^/         | /'
-            # dmesg only when blktests itself flagged it (reason=dmesg).
-            if grep -q "reason='dmesg'" <<<"$LAST_STATUS_LINE" \
-               && grep -q 'NDT_DMESG_BEGIN' "$log" 2>/dev/null; then
-                echo "       dmesg:"
-                sed -n '/NDT_DMESG_BEGIN/,/NDT_DMESG_END/p' "$log" \
-                    | sed -e '1d;$d' | tail -20 | sed 's/^/         | /'
-            fi
+            printf 'FAIL: %s\n' "$watcher_msg" > "$verdict"
+        fi
+    elif [[ ! -s "$verdict" ]]; then
+        if (( scenario_rc != 0 )); then
+            {
+                printf 'FAIL: script error (rc=%d)\n' "$scenario_rc"
+                printf -- '--- scenario.log tail ---\n'
+                tail -20 "$slog"
+            } > "$verdict"
+        else
+            printf 'FAIL: scenario exited 0 without verdict\n' > "$verdict"
+        fi
+    fi
+
+    local actual=PASS
+    head -1 "$verdict" | grep -q '^FAIL' && actual=FAIL
+
+    # Cleanup: try clean EXIT, then kill.
+    if kill -0 "$qemu_pid" 2>/dev/null; then
+        printf 'EXIT\n' | socat -u - "UNIX-CONNECT:/tmp/qemu-ctrl.sock" 2>/dev/null || true
+        for _w in $(seq 1 100); do
+            kill -0 "$qemu_pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -9 "$qemu_pid" 2>/dev/null
+    fi
+    wait "$qemu_pid" 2>/dev/null
+    kill "$socat_pid" 2>/dev/null
+    wait "$socat_pid" 2>/dev/null
+
+    # Compare actual to expected (from `# ndt-expected:` header, default pass).
+    local expected result
+    if ! expected=$(parse_test_expected "$path"); then
+        expected=pass   # parser already complained; treat as default
+    fi
+    if [[ ( "$actual" == "PASS" && "$expected" == "pass" ) \
+       || ( "$actual" == "FAIL" && "$expected" == "fail" ) ]]; then
+        result=OK
+    else
+        result=MISMATCH
+    fi
+    {
+        printf 'actual=%s\nexpected=%s\nresult=%s\n' \
+            "$actual" "$expected" "$result"
+    } > "$iter_dir/result.txt"
+
+    # Stash for caller summary (last-iter-wins is fine — caller reads files).
+    LAST_ACTUAL=$actual
+    LAST_EXPECTED=$expected
+    LAST_RESULT=$result
+
+    [[ "$result" == "OK" ]]
+}
+
+# --- main loop --------------------------------------------------------------
+
+total=$(( ${#tests_paths[@]} * iters ))
+current=0
+passes=0
+fails=0
+declare -a summary_rows
+
+run_t0=$EPOCHSECONDS
+
+for k in "${!tests_paths[@]}"; do
+    name="${tests_names[$k]}"
+    path="${tests_paths[$k]}"
+    mkdir -p "$RUN_DIR/$name"
+    for (( it = 1; it <= iters; it++ )); do
+        current=$((current + 1))
+        printf '[ndt] %d/%d  %-30s iter %3d/%-3d ... ' \
+            "$current" "$total" "$name" "$it" "$iters"
+        t0=$EPOCHSECONDS
+        LAST_ACTUAL=""; LAST_EXPECTED=""; LAST_RESULT=""
+        run_iter "$name" "$path" "$it"
+        rc=$?
+        dt=$((EPOCHSECONDS - t0))
+        iter_dir="$RUN_DIR/$name/iter-$(printf '%03d' "$it")"
+        verdict_line=$(head -1 "$iter_dir/verdict.txt" 2>/dev/null || echo "(no verdict)")
+        summary_rows+=( "$(printf '%-30s %03d   %-4s  %-4s  %-8s  %5ds  %s' \
+            "$name" "$it" "$LAST_ACTUAL" "$LAST_EXPECTED" "$LAST_RESULT" "$dt" "$verdict_line")" )
+        if (( rc == 0 )); then
+            passes=$((passes + 1))
+            echo "OK    (${dt}s)  actual=$LAST_ACTUAL expected=$LAST_EXPECTED"
+        else
+            fails=$((fails + 1))
+            echo "MISMATCH  (${dt}s)  actual=$LAST_ACTUAL expected=$LAST_EXPECTED"
+            echo "        $verdict_line"
+            echo "        log: $iter_dir/"
             if (( stop_at_fail )); then
-                echo "[ndt] --stop-at-fail set, aborting remaining runs"
+                echo "[ndt] --stop-at-fail, aborting"
                 break 2
             fi
         fi
     done
 done
 
-echo "---"
-echo "[ndt] summary: ${pass}/${total} passed (fail=${fail})"
-(( fail == 0 ))
+run_dt=$((EPOCHSECONDS - run_t0))
+
+# --- summary ----------------------------------------------------------------
+
+{
+    cat "$RUN_DIR/args.txt"
+    printf 'duration: %ds\n' "$run_dt"
+    echo
+    printf '%-30s %5s   %-4s  %-4s  %-8s  %6s  %s\n' \
+        test iter actual exp result time 'detail'
+    for row in "${summary_rows[@]}"; do
+        echo "$row"
+    done
+    echo
+    printf 'summary: %d/%d OK (mismatch=%d)\n' "$passes" "$total" "$fails"
+} | tee "$RUN_DIR/summary.txt"
+
+echo
+echo "[ndt] artifacts: $RUN_DIR/"
+echo "[ndt] symlink:   /tmp/ndt/latest"
+
+(( fails == 0 ))

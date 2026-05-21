@@ -15,3 +15,6 @@
 	path = third_party/pcimem
 	url = https://github.com/billfarrow/pcimem.git
 	shallow = true
+[submodule "third_party/nvmet-pci-sw"]
+	path = third_party/nvmet-pci-sw
+	url = git@github.com:Mateusz-Nowicki-Embedded/nvmet-pci-sw.git

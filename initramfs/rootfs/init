@@ -1,5 +1,20 @@
-#!/bin/sh
-# PID 1 for the QEMU initramfs.
+#!/bin/bash
+# PID 1 for the QEMU initramfs.  NDT command-loop.
+#
+# After mounts + udev + modprobe nvme, we drop into a read loop on
+# /dev/ttyS1 dispatching commands sent by the host scenario script.
+# Every command emits NDT_CMD_DONE on ttyS0 so the host knows it can
+# send the next one.
+#
+# Vocabulary v1:
+#   RUN <blktest> [k=v ...]   run ./check <blktest>, k=v exported as env
+#   EXEC <shell-cmd...>       eval payload in a subshell
+#   GO                        no-op at main-loop level (sub-tests consume
+#                             GO directly from ttyS1 — inner-iter gate)
+#   DMESG                     dump dmesg between NDT_DMESG_{BEGIN,END}
+#   EXIT                      clean poweroff
+#
+# Unknown command aborts the session.  ttyS1 idle timeout: 300 s.
 
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -9,7 +24,6 @@ mount -t tmpfs tmpfs /run
 mount -t debugfs none /sys/kernel/debug
 mount -t tracefs none /sys/kernel/tracing 2>/dev/null || true
 
-# /dev/fd needed for bash <(...) process substitution
 ln -s /proc/self/fd /dev/fd 2>/dev/null
 ln -s /proc/self/fd/0 /dev/stdin 2>/dev/null
 ln -s /proc/self/fd/1 /dev/stdout 2>/dev/null
@@ -22,11 +36,6 @@ echo
 echo "=== nvme QEMU rootfs ==="
 echo "kernel: $(uname -r)"
 
-# Load NVMe driver via modprobe (resolves nvme-core dep automatically from modules.dep).
-#modprobe nvme && echo "[init] nvme loaded"
-
-# Start udev daemon (multi-call binary: systemd-udevd is a symlink to udevadm).
-# udev manages /dev nodes, populates /dev/disk/by-* links, settles after add events.
 mkdir -p /run/udev
 /usr/lib/systemd/systemd-udevd --daemon
 udevadm trigger --action=add --type=subsystems
@@ -34,84 +43,143 @@ udevadm trigger --action=add --type=devices
 udevadm settle --timeout=10
 echo "[init] udev ready"
 
-# NDT test mode: run a single blktests case if ndt_test=<id> is on the kernel
-# cmdline (e.g. ndt_test=nvme/068), then power off so the host sees QEMU exit.
-ndt_test=$(awk -v RS=' ' -F= '/^ndt_test=/{print $2}' /proc/cmdline | tr -d '\n')
-# Optional: inner-iter count exported as $NDT_INNER_ITER for tests
-# that loop reset scenarios inside one ./check invocation (e.g. 068).
-ndt_inner_iter=$(awk -v RS=' ' -F= '/^ndt_inner_iter=/{print $2}' /proc/cmdline | tr -d '\n')
-if [ -n "$ndt_inner_iter" ]; then
-    export NDT_INNER_ITER=$ndt_inner_iter
-fi
-if [ -n "$ndt_test" ]; then
-    echo "=== NDT_BEGIN test=$ndt_test ==="
-    modprobe nvme
-    # Burn the kernel's one-shot "capability attribute has been deprecated"
-    # warning here so it doesn't land mid-test (nvme/039 last_dmesg | tail -2
-    # would otherwise lose a real error line to this noise).
-    cat /sys/block/*/capability > /dev/null 2>&1 || true
+# Host nvme driver is needed to bind to our software endpoint (nvmet-pci-sw
+# exposes a fake NVMe device on bus 0xfe).  Loaded here so it's ready when
+# the module brings the bridge up.
+modprobe nvme
 
-    # Hand control back to the host so it can program things that only make
-    # sense once the driver has created I/O queues — e.g. per-SQ completion
-    # delay via the QEMU monitor.  The host reads this sentinel from the
-    # console socket, runs whatever HMP commands it wants, then writes a
-    # line to /dev/ttyS1 to release us.  The line content is not parsed
-    # today (any line unblocks); future commands can be added here.
-    echo "=== NDT_PHASE phase='ready-for-cmd' ==="
-    read -r _ctrl_line < /dev/ttyS1 || true
-    echo "=== NDT_PHASE phase='running' ==="
+# Auto-build the nvmet target chain that backs our endpoint: null_blk
+# provides the namespace, nvmet exposes it, nvmet-pci-sw plugs into both.
+modprobe null_blk nr_devices=1
+modprobe nvmet
+mkdir -p /sys/kernel/config
+mount -t configfs configfs /sys/kernel/config
 
-    cd /opt/blktests
-    ./check "$ndt_test"
-    # blktests writes one result file per TEST_DEV — e.g. with
-    # TEST_DEVS=(nvme0n2 nvme0n3) both results/nvme0n2/nvme/068 and
-    # results/nvme0n3/nvme/068 are produced.  Aggregation rules:
-    #   - any per-device "fail" wins   -> overall fail (with that reason)
-    #   - else if any device passed    -> overall pass
-    #   - else (all skipped/not run)   -> overall "not run"
-    # blktests result format is TAB-separated: "<key>\t<value>"; values may
-    # contain spaces (e.g. "not run").
-    any_pass=0; any_fail=0; fail_reason=; skip_reason=
-    for d in results/*/; do
-        f="${d}${ndt_test}"
-        [ -f "$f" ] || continue
+mkdir -p /sys/kernel/config/nvmet/subsystems/nqn.test
+echo 1 > /sys/kernel/config/nvmet/subsystems/nqn.test/attr_allow_any_host
+mkdir /sys/kernel/config/nvmet/subsystems/nqn.test/namespaces/1
+echo /dev/nullb0 > \
+    /sys/kernel/config/nvmet/subsystems/nqn.test/namespaces/1/device_path
+echo 1 > /sys/kernel/config/nvmet/subsystems/nqn.test/namespaces/1/enable
+
+modprobe nvmet-pci-sw
+mkdir /sys/kernel/config/nvmet/ports/1
+echo pci > /sys/kernel/config/nvmet/ports/1/addr_trtype
+ln -s /sys/kernel/config/nvmet/subsystems/nqn.test \
+    /sys/kernel/config/nvmet/ports/1/subsystems/nqn.test
+
+# Wait for the host nvme driver to bind the endpoint and publish the
+# block device — tests assume /dev/nvme0n1 exists by ready-for-cmd.
+# The endpoint is the only NVMe controller present, so it always
+# gets nvme0.
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -e /dev/nvme0n1 ] && break
+    sleep 0.5
+done
+[ -e /dev/nvme0n1 ] || echo "[init] WARNING: /dev/nvme0n1 not present after 10s"
+
+udevadm settle --timeout=10
+
+# Burn the one-shot "capability attribute has been deprecated" warning so it
+# does not race blktest dmesg scans (nvme/039 etc.).
+cat /sys/block/*/capability > /dev/null 2>&1 || true
+
+# Disable echo on the ctrl channel; without this every byte the host writes
+# to /dev/ttyS1 is echoed back, which interleaves with our reads and makes
+# `bash read` see scrambled lines like "echEXEC".
+stty -F /dev/ttyS1 -echo -echoe -echok -echoctl -echoke 2>/dev/null || true
+
+ndt_emit() { echo "=== $* ==="; }
+
+# RUN <blktest> [k=v ...]
+# k=v args are exported as env; ./check inherits them so tests can read
+# e.g. $NDT_INNER_ITER, $NDT_REPRO_ROUNDS.  Per-namespace result files are
+# aggregated: any fail wins, else any pass, else not-run.
+ndt_run() {
+    local blktest=$1; shift
+    local kv
+    for kv in "$@"; do
+        case "$kv" in *=*) export "$kv" ;; esac
+    done
+
+    ( cd /opt/blktests && ./check "$blktest" )
+
+    local any_pass=0 any_fail=0 fail_reason="" skip_reason=""
+    local d f s r
+    for d in /opt/blktests/results/*/; do
+        f="${d}${blktest}"
+        [[ -f "$f" ]] || continue
         s=$(sed -n 's/^status\t//p' "$f" | head -1)
         r=$(sed -n 's/^reason\t//p' "$f" | head -1)
         case "$s" in
-            pass)
-                any_pass=1
-                ;;
-            "not run"|skipped|"")
-                [ -z "$skip_reason" ] && skip_reason="$r"
-                ;;
-            *)
-                any_fail=1
-                [ -z "$fail_reason" ] && fail_reason="$r"
-                ;;
+            pass) any_pass=1 ;;
+            "not run"|skipped|"") [[ -z "$skip_reason" ]] && skip_reason="$r" ;;
+            *)    any_fail=1; [[ -z "$fail_reason" ]] && fail_reason="$r" ;;
         esac
     done
-    if [ "$any_fail" = 1 ]; then
-        result_status=fail
-        result_reason=$fail_reason
-    elif [ "$any_pass" = 1 ]; then
-        result_status=pass
-        result_reason=
+
+    local status reason rc
+    if (( any_fail )); then
+        status=fail;     reason=$fail_reason;  rc=1
+    elif (( any_pass )); then
+        status=pass;     reason="";            rc=0
     else
-        result_status="not run"
-        result_reason=$skip_reason
+        status="not run"; reason=$skip_reason; rc=1
     fi
-    echo "=== NDT_STATUS status='${result_status:-unknown}' reason='${result_reason:-}' ==="
-    # dmesg only on non-pass: spares serial bandwidth and host console log.
-    if [ "$result_status" != "pass" ]; then
-        echo "=== NDT_DMESG_BEGIN ==="
-        dmesg
-        echo "=== NDT_DMESG_END ==="
+    ndt_emit "NDT_STATUS status='$status' reason='${reason:-}'"
+    return $rc
+}
+
+ndt_dmesg() {
+    ndt_emit "NDT_DMESG_BEGIN"
+    dmesg
+    ndt_emit "NDT_DMESG_END"
+}
+
+ndt_emit "NDT_PHASE phase='ready-for-cmd'"
+
+ndt_rc=0
+while :; do
+    if ! IFS= read -t 300 -r ndt_line < /dev/ttyS1; then
+        ndt_emit "NDT_PHASE phase='idle-timeout'"
+        ndt_rc=124
+        break
     fi
-    echo "=== NDT_END ==="
-    poweroff -f
-fi
+    ndt_line=${ndt_line%$'\r'}
+    [[ -z "$ndt_line" ]] && continue
 
-echo "type 'poweroff -f' (or Ctrl+A x) to exit QEMU"
-echo
+    read -ra ndt_parts <<< "$ndt_line"
+    ndt_cmd=${ndt_parts[0]}
 
-exec /bin/sh
+    case "$ndt_cmd" in
+        RUN)
+            ndt_run "${ndt_parts[@]:1}"
+            ndt_emit "NDT_CMD_DONE cmd='RUN' rc=$?"
+            ;;
+        EXEC)
+            ndt_payload=${ndt_line#EXEC}
+            ndt_payload=${ndt_payload# }
+            ( eval "$ndt_payload" )
+            ndt_emit "NDT_CMD_DONE cmd='EXEC' rc=$?"
+            ;;
+        GO)
+            ndt_emit "NDT_CMD_DONE cmd='GO' rc=0"
+            ;;
+        DMESG)
+            ndt_dmesg
+            ndt_emit "NDT_CMD_DONE cmd='DMESG' rc=0"
+            ;;
+        EXIT)
+            ndt_emit "NDT_CMD_DONE cmd='EXIT' rc=0"
+            break
+            ;;
+        *)
+            ndt_emit "NDT_CMD_DONE cmd='?' rc=127 reason='unknown: $ndt_cmd'"
+            ndt_rc=127
+            break
+            ;;
+    esac
+done
+
+ndt_emit "NDT_END rc=$ndt_rc"
+poweroff -f
