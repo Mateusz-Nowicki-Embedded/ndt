@@ -1,0 +1,782 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+#
+# Default helper functions.
+
+shopt -s extglob
+
+. common/shellcheck
+# Include fio helpers by default.
+. common/fio
+. common/cgroup
+. common/dm
+
+declare IO_URING_DISABLED
+declare -a SYSTEMCTL_UNITS_TO_STOP
+export TO_SKIP=255
+
+# If a test runs multiple "subtests", then each subtest should typically run
+# for TIMEOUT / number of subtests.
+_divide_timeout() {
+	local num_tests="$1"
+	if [[ "${TIMEOUT:-}" ]]; then
+		((TIMEOUT = (TIMEOUT + num_tests - 1) / num_tests))
+	fi
+}
+
+_have_root() {
+	if [[ $EUID -ne 0 ]]; then
+		SKIP_REASONS+=("not running as root")
+		return 1
+	fi
+	return 0
+}
+
+_module_file_exists()
+{
+	local ko_underscore=${1//-/_}.ko
+	local ko_hyphen=${1//_/-}.ko
+	local libpath
+
+	libpath="/lib/modules/$(uname -r)/kernel"
+	[[ ! -d $libpath ]] && return 1
+	local module_path
+	module_path="$(find "$libpath" -name "$ko_underscore*" -o \
+			-name "$ko_hyphen*")"
+	[ -n "${module_path}" ]
+}
+
+# Check that the specified module or driver is available, regardless of whether
+# it is built-in or built separately as a module. Load the module if it is
+# loadable and not yet loaded. In this case, the loaded module is unloaded at
+# test case end regardless of whether the test case is skipped or executed.
+_have_driver()
+{
+	local modname="${1//-/_}"
+
+	if [ -d "/sys/module/${modname}" ]; then
+		return 0
+	fi
+
+	if ! modprobe -q "${modname}"; then
+		SKIP_REASONS+=("driver ${modname} is not available")
+		return 1
+	fi
+
+	MODULES_TO_UNLOAD+=("${modname}")
+
+	return 0
+}
+
+# Load the specified module. Record the module to MODULES_TO_UNLOAD so that they
+# will be unloaded by _unload_modules() after each test case run.
+_load_module() {
+	local modname="${1/-/_}"
+
+	if ! modprobe --quiet --first-time "${modname}"; then
+		return 1
+	fi
+
+	MODULES_TO_UNLOAD+=("${modname}")
+}
+
+# Check that the specified crypto algorithm is present, regardless of whether
+# it's built-in or as module.
+_have_crypto_algorithm()
+{
+	local algo="$1"
+
+	if grep --quiet "${algo}" /proc/crypto; then
+		return 0
+	fi
+
+	_have_driver "${algo}"
+}
+
+# Check that the specified module is available as a loadable module and not
+# built-in the kernel.
+_have_module() {
+	if ! _module_file_exists "${1}"; then
+		SKIP_REASONS+=("module ${1} is not available")
+		return 1
+	fi
+	return 0
+}
+
+_module_not_in_use() {
+	local refcnt
+
+	_have_module "$1" || return
+
+	if [ -d "/sys/module/$1" ]; then
+		refcnt="$(cat /sys/module/"$1"/refcnt)"
+		if [ "$refcnt" -ne "0" ]; then
+			SKIP_REASONS+=("module $1 is in use")
+		fi
+	fi
+}
+
+_have_module_param() {
+	 _have_driver "$1" || return
+
+	if [ -d "/sys/module/$1" ]; then
+		if [ -e "/sys/module/$1/parameters/$2" ]; then
+			return 0
+		fi
+	fi
+
+	if ! modinfo -F parm -0 "$1" | grep -q -z "^$2:"; then
+		SKIP_REASONS+=("module $1 does not have parameter $2")
+		return 1
+	fi
+	return 0
+}
+
+_have_module_param_value() {
+	local modname="${1/-/_}"
+	local param="$2"
+	local expected_value="$3"
+	local value
+
+	if ! _have_module_param "$modname" "$param"; then
+		return 1
+	fi
+
+	value=$(cat "/sys/module/$modname/parameters/$param")
+	if [[ "${value}" != "$expected_value" ]]; then
+		SKIP_REASONS+=("module $modname parameter $param must be set to $expected_value")
+		return 1
+	fi
+
+	return 0
+}
+
+_have_program() {
+	if command -v "$1" >/dev/null 2>&1; then
+		return 0
+	fi
+	SKIP_REASONS+=("command $1 is not available")
+	return 1
+}
+
+# Check whether the iproute2 snapshot is greater than or equal to $1.
+_have_iproute2() {
+	local snapshot
+
+	if ! snapshot=$(ip -V | sed 's/ip utility, iproute2-ss//'); then
+		SKIP_REASONS+=("ip utility not found")
+		return 1
+	fi
+	if [[ "$snapshot" =~ ^[0-9]+$ && "$snapshot" -lt "$1" ]]; then
+		SKIP_REASONS+=("ip utility too old")
+		return 1
+	fi
+	return 0
+}
+
+_have_src_program() {
+	if [[ ! -x "$SRCDIR/$1" ]]; then
+		SKIP_REASONS+=("$1 was not built; run \`make\`")
+		return 1
+	fi
+	return 0
+}
+
+_have_loop() {
+	_have_driver loop && _have_program losetup
+}
+
+_have_kernel_source() {
+	if [ -z "${KERNELSRC}" ]; then
+		SKIP_REASONS+=("KERNELSRC not set")
+		return 1
+	fi
+	return 0
+}
+
+_have_blktrace() {
+	# CONFIG_BLK_DEV_IO_TRACE might still be disabled, but this is easier
+	# to check. We can fix it if someone complains.
+	if [[ ! -d /sys/kernel/debug/block ]]; then
+		SKIP_REASONS+=("CONFIG_DEBUG_FS is not enabled")
+		return 1
+	fi
+	_have_program blktrace
+}
+
+_have_configfs() {
+	if ! findmnt -t configfs /sys/kernel/config >/dev/null; then
+		SKIP_REASONS+=("configfs is not mounted at /sys/kernel/config")
+		return 1
+	fi
+	return 0
+}
+
+# Check if the specified kernel config files are available.
+_have_kernel_config_file() {
+	if [[ ! -f /proc/config.gz && ! -f /boot/config-$(uname -r) ]]; then
+		SKIP_REASONS+=("kernel $(uname -r) config not found")
+		return 1
+	fi
+
+	return 0
+}
+
+# Combine _have_kernel_config_file() and _check_kernel_option().
+# Set SKIP_REASONS when _check_kernel_option() returns false.
+_have_kernel_option() {
+	local opt=$1
+
+	_have_kernel_config_file || return
+	if ! _check_kernel_option "$opt"; then
+		SKIP_REASONS+=("kernel option $opt has not been enabled")
+		return 1
+	fi
+
+	return 0
+}
+
+_have_kernel_options() {
+	local ret=0
+
+	for opt in "$@"; do
+		_have_kernel_option "$opt" || ret=1
+	done
+
+	return $ret
+}
+
+# Compare the version string in $1 in "a.b.c" format with "$2.$3.$4".
+# If "a.b.c" is smaller than "$2.$3.$4", return true. Otherwise, return
+# false.
+_compare_three_version_numbers() {
+	local -i a b c d e f
+
+	IFS='.' read -r a b c <<< "$1"
+	d=${2:0}
+	e=${3:0}
+	f=${4:0}
+	if ((a * 65536 + b * 256 + c < d * 65536 + e * 256 + f)); then
+		return 0
+	fi
+	return 1
+}
+
+# Check whether the version of the running kernel is greater than or equal to
+# $1.$2.$3
+_have_kver() {
+	if _compare_three_version_numbers \
+	     "$(uname -r | sed 's/-.*//;s/[^.0-9]//')" "$1" "$2" "$3"; then
+		SKIP_REASONS+=("Kernel version is older than ${1}.${2}.${3}")
+		return 1
+	fi
+}
+
+_have_tracefs() {
+	stat /sys/kernel/debug/tracing/trace > /dev/null 2>&1
+	if ! findmnt -t tracefs /sys/kernel/debug/tracing >/dev/null; then
+		SKIP_REASONS+=("tracefs is not mounted at /sys/kernel/debug/tracing")
+		return 1
+	fi
+	return 0
+}
+
+_have_tracepoint() {
+	local event=$1
+
+	if [[ ! -d /sys/kernel/debug/tracing/events/${event} ]]; then
+		SKIP_REASONS+=("tracepoint ${event} does not exist")
+		return 1
+	fi
+	return 0
+}
+
+_have_fs() {
+	modprobe "$1" >/dev/null 2>&1
+	if [[ ! -d "/sys/fs/$1" ]]; then
+		SKIP_REASONS+=("kernel does not support filesystem $1")
+		return 1
+	fi
+}
+
+_require_min_cpus() {
+	if [[ $(nproc) -ge $1 ]]; then
+		return 0
+	fi
+	SKIP_REASONS+=("minimum $1 cpus required")
+	return 1
+}
+
+_test_dev_is_rotational() {
+	[[ $(cat "${TEST_DEV_SYSFS}/queue/rotational") -ne 0 ]]
+}
+
+_require_test_dev_sysfs() {
+	local attr ret=0
+	for attr in "$@"; do
+		if [[ ! -e "${TEST_DEV_SYSFS}/$attr" ]]; then
+			SKIP_REASONS+=("${TEST_DEV} does not have sysfs attribute $attr")
+			ret=1
+		fi
+	done
+	return $ret
+}
+
+_require_test_dev_is_rotational() {
+	if ! _test_dev_is_rotational; then
+		SKIP_REASONS+=("$TEST_DEV is not rotational")
+		return 1
+	fi
+	return 0
+}
+
+_test_dev_can_discard() {
+	[[ $(cat "${TEST_DEV_SYSFS}/queue/discard_max_bytes") -gt 0 ]]
+}
+
+_require_test_dev_can_discard() {
+	if ! _test_dev_can_discard; then
+		SKIP_REASONS+=("$TEST_DEV does not support discard")
+		return 1
+	fi
+	return 0
+}
+
+_require_device_support_atomic_writes() {
+	_require_test_dev_sysfs queue/atomic_write_max_bytes
+	if (( $(< "${TEST_DEV_SYSFS}"/queue/atomic_write_max_bytes) == 0 )); then
+		SKIP_REASONS+=("${TEST_DEV} does not support atomic write")
+		return 1
+	fi
+}
+
+_test_dev_queue_get() {
+	if [[ $1 = scheduler ]]; then
+		sed -e 's/.*\[//' -e 's/\].*//' "${TEST_DEV_SYSFS}/queue/scheduler"
+	else
+		cat "${TEST_DEV_SYSFS}/queue/$1"
+	fi
+}
+
+_test_dev_queue_set() {
+	local path="${TEST_DEV_SYSFS}/queue/$1"
+
+	# For bash >=4.3 we'd write if [[ ! -v SYSFS_QUEUE_SAVED["$path"] ]].
+	if [[ -z ${SYSFS_QUEUE_SAVED["$path"]} &&
+	      ${SYSFS_QUEUE_SAVED["$path"]-unset} == unset ]]; then
+		SYSFS_QUEUE_SAVED["$path"]="$(_test_dev_queue_get "$1")"
+	fi
+	if ! echo "$2" >"$path"; then
+		echo "echo $2 > $path failed"
+		return 1
+	fi
+}
+
+_test_dev_set_scheduler() {
+	if [[ -w "${TEST_DEV_SYSFS}/queue/scheduler" ]]; then
+		_test_dev_queue_set scheduler "$1"
+	elif _test_dev_is_dm; then
+		_dm_destination_dev_set_scheduler "$1"
+	fi
+}
+
+_require_test_dev_is_pci() {
+	if ! readlink -f "$TEST_DEV_SYSFS/device" | grep -q pci; then
+		# nvme needs some special casing
+		if readlink -f "$TEST_DEV_SYSFS/device" | grep -q nvme; then
+			local blkdev
+			local ctrldev
+			# First get the controller device from the namespace blockdev
+			blkdev="$(echo "$TEST_DEV_SYSFS" | cut -d '/' -f 7)"
+			ctrldev="$(echo "$blkdev" | grep -Eo 'nvme[0-9]+')"
+			# Then get the pci device from the controller device
+			if readlink -f "$ctrldev/device" | grep -1 pci; then
+				return 0
+			fi
+		fi
+
+		SKIP_REASONS+=("$TEST_DEV is not a PCI device")
+		return 1
+	fi
+	return 0
+}
+
+_get_pci_from_dev_sysfs() {
+	readlink -f "$1/device" | \
+		grep -Eo '[0-9a-f]{4,5}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]' | \
+		tail -1
+}
+
+_get_pci_dev_from_blkdev() {
+	_get_pci_from_dev_sysfs "$TEST_DEV_SYSFS"
+}
+
+_get_pci_parent_from_blkdev() {
+	readlink -f "$TEST_DEV_SYSFS/device" | \
+		grep -Eo '[0-9a-f]{4,5}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]' | \
+		tail -2 | head -1
+}
+
+_require_test_dev_size() {
+	local require_sz_mb
+	local test_dev_sz_mb
+
+	require_sz_mb="$(convert_to_mb "$1")"
+	test_dev_sz_mb="$(($(blockdev --getsize64 "$TEST_DEV")/1024/1024))"
+
+	if (( "$test_dev_sz_mb" < "$require_sz_mb" )); then
+		SKIP_REASONS+=("${TEST_DEV} required at least ${require_sz_mb}m")
+		return 1
+	fi
+	return 0
+}
+
+_require_test_dev_in_hotplug_slot() {
+	local parent
+	parent="$(_get_pci_parent_from_blkdev)"
+
+	local slt_cap
+	slt_cap="$(setpci -s "${parent}" CAP_EXP+14.w)"
+	if [[ $((0x${slt_cap} & 0x60)) -ne $((0x60)) ]]; then
+		SKIP_REASONS+=("$TEST_DEV is not in a hot pluggable slot")
+		return 1
+	fi
+	return 0
+}
+
+_test_dev_is_partition() {
+	[[ -n ${TEST_DEV_PART_SYSFS} ]]
+}
+
+_min_io() {
+	local path_or_dev=$1
+	local min_io
+
+	if [ -z "$path_or_dev" ]; then
+		echo "path for min_io does not exist"
+		return 1
+	fi
+
+	if [ -c "$path_or_dev" ]; then
+		if [[ "$path_or_dev" == /dev/ng* ]]; then
+			path_or_dev="${path_or_dev/ng/nvme}"
+		fi
+	fi
+
+	if [ -e "$path_or_dev" ]; then
+		min_io=$(stat --printf=%o "$path_or_dev")
+		# Keep 4K minimum IO size for historical consistency
+		((min_io < 4096)) && min_io=4096
+		echo "$min_io"
+	else
+		echo "Error: '$path_or_dev' does not exist or is not accessible"
+		return 1
+	fi
+}
+
+# Return max open zones or max active zones of the test target device.
+# If the device has both, return smaller value.
+_test_dev_max_open_active_zones() {
+	local -i moz=0
+	local -i maz=0
+
+	if [[ -r "${TEST_DEV_SYSFS}/queue/max_open_zones" ]]; then
+		moz=$(_test_dev_queue_get max_open_zones)
+	fi
+
+	if [[ -r "${TEST_DEV_SYSFS}/queue/max_active_zones" ]]; then
+		maz=$(_test_dev_queue_get max_active_zones)
+	fi
+
+	if ((!moz)) || ((maz && maz < moz)); then
+		echo "${maz}"
+	else
+		echo "${moz}"
+	fi
+}
+
+_require_test_dev_is_partition() {
+	if ! _test_dev_is_partition; then
+		SKIP_REASONS+=("${TEST_DEV} is not a partition device")
+		return 1
+	fi
+	return 0
+}
+
+_require_normal_user() {
+	if ! id "$NORMAL_USER" >/dev/null 2>&1; then
+		SKIP_REASONS+=("valid NORMAL_USER is not specified")
+		return 1
+	fi
+	return 0
+}
+
+# Prints a space-separated list with the names of all I/O schedulers supported
+# by block device $1.
+_io_schedulers() {
+	local path=/sys/class/block/$1/queue/scheduler
+
+	[ -e "${path}" ] || return 1
+	sed 's/[][]//g' "${path}"
+}
+
+# Older versions of xfs_io use pwrite64 and such, so the error messages won't
+# match current versions of xfs_io. See c52086226bc6 ("filter: xfs_io output
+# has dropped "64" from error messages") in xfstests.
+_filter_xfs_io_error() {
+	sed -e 's/^\(.*\)64\(: .*$\)/\1\2/'
+}
+
+# System uptime in seconds.
+_uptime_s() {
+	awk '{ print int($1) }' /proc/uptime
+}
+
+_have_writeable_kmsg() {
+	if [[ ! -w /dev/kmsg ]]; then
+		SKIP_REASONS+=("cannot write to /dev/kmsg")
+		return 1
+	fi
+	return 0
+}
+
+_have_systemctl_unit() {
+	local unit="$1"
+
+	_have_program systemctl || return 1
+	if ! grep -qe "$unit" < <(systemctl list-unit-files); then
+		SKIP_REASONS+=("systemctl unit '${unit}' is missing")
+		return 1
+	fi
+	return 0
+}
+
+# Get system page size from kernel conguration
+_get_page_size() {
+	local page_shift
+
+	page_shift=$(_get_kernel_option PAGE_SHIFT)
+
+	echo $((1<< page_shift))
+}
+
+# Check if the system page size matches the required size (in bytes).
+# Example: _page_size_equals 4096
+_page_size_equals() {
+	local required_size="$1"
+	local current_size
+
+	current_size=$(_get_page_size)
+
+	if [ "$current_size" -ne "$required_size" ]; then
+		SKIP_REASONS+=("This test requires ${required_size} bytes page size, but system has ${current_size} bytes")
+		return 1
+	fi
+
+	return 0
+}
+
+_systemctl_start() {
+	local unit="$1"
+
+	if systemctl is-active --quiet "$unit"; then
+		return
+	fi
+
+	if systemctl start "$unit"; then
+		SYSTEMCTL_UNITS_TO_STOP+=("$unit")
+	fi
+}
+
+_systemctl_stop() {
+	local unit
+
+	for unit in "${SYSTEMCTL_UNITS_TO_STOP[@]}"; do
+		systemctl stop "$unit"
+	done
+}
+
+_systemctl_unit_is_active() {
+	local unit="$1"
+
+	if command -v systemctl &>/dev/null &&
+			systemctl is-active --quiet "$unit"; then
+		return 0
+	fi
+	return 1
+}
+
+_systemd_stop_udevd() {
+	if _systemctl_unit_is_active "systemd-udevd"; then
+		systemctl --quiet stop systemd-udevd
+		systemctl --quiet mask systemd-udevd
+	else
+		echo "WARNING: systemd-udevd is not active"
+	fi
+}
+
+_systemd_start_udevd() {
+	if ! _systemctl_unit_is_active "systemd-udevd"; then
+		systemctl --quiet unmask systemd-udevd
+		systemctl --quiet start systemd-udevd
+	fi
+	if ! _systemctl_unit_is_active "systemd-udevd"; then
+		echo "WARNING: systemd-udevd not started"
+		return 1
+	fi
+	return 0
+}
+
+_have_systemd_ver() {
+	local required_ver=${1}
+	local ver
+
+	if ! command -v systemctl &>/dev/null; then
+		SKIP_REASONS+=("systemd is not available")
+		return 1
+	fi
+
+	ver=$(systemctl --version | head -1 | sed 's/systemd //;s/[^0-9].*//')
+	if ((ver < required_ver)); then
+		SKIP_REASONS+=("systemd version is older than ${required_ver}")
+		return 1
+	fi
+}
+
+# Run the given command as NORMAL_USER
+_run_user() {
+	su "$NORMAL_USER" -c "$1"
+}
+
+convert_to_mb()
+{
+	local str=$1
+	local res
+
+	res=$(echo "${str}" | sed -n 's/^\([0-9]\+\)$/\1/p')
+	if [[ -n "${res}" ]]; then
+		echo "$((res / 1024 / 1024))"
+	fi
+
+	res=$(echo "${str}" | sed -n 's/^\([0-9]\+\)[mM]$/\1/p')
+	if [[ -n "${res}" ]]; then
+		echo "$((res))"
+	fi
+
+	res=$(echo "${str}" | sed -n 's/^\([0-9]\+\)[gG]$/\1/p')
+	if [[ -n "${res}" ]]; then
+		echo "$((res * 1024))"
+	fi
+}
+
+# Combine multiple _set_conditions() hooks to iterate all combinations of them.
+# When one hook x has conditions x1 and x2, and the other hook y has y1 and y2,
+# iterate (x1, y1), (x2, y1), (x1, y2) and (x2, y2). In other words, it iterates
+# the Cartesian product of the given condiition sets.
+_set_combined_conditions()
+{
+	local -i index
+	local -a hooks
+	local -a nr_conds
+	local total_nr_conds=1
+	local i nr_cond _cond_desc
+	local -a last_arg
+
+	last_arg=("${@: -1}")
+	if [[ ${last_arg[*]} =~ ^[0-9]+$ ]]; then
+		index=$((${last_arg[*]}))
+	fi
+	read -r -a hooks <<< "${@/$index}"
+
+	nr_hooks=${#hooks[@]}
+
+	# Check how many conditions each hook has. Multiply them all to get
+	# the total number of the combined conditions.
+	for ((i = 0; i < nr_hooks; i++)); do
+		nr_cond=$(eval "${hooks[i]}")
+		nr_conds+=("$nr_cond")
+		total_nr_conds=$((total_nr_conds * nr_cond))
+	done
+
+	if [[ -z $index ]]; then
+		echo $((total_nr_conds))
+		return
+	fi
+
+	# Calculate the index of the each hook and call them. Concatenate the
+	# COND_DESC of the all hooks return.
+	for ((i = 0; i < nr_hooks; i++)); do
+		eval "${hooks[i]}" $((index % nr_conds[i]))
+		index=$((index / nr_conds[i]))
+		[[ -n $_cond_desc ]] && _cond_desc="${_cond_desc} "
+		_cond_desc="${_cond_desc}${COND_DESC}"
+	done
+	COND_DESC="$_cond_desc"
+}
+
+# Check both old and new parameters are not configured. If the old parameter is
+# set, propagate to the new parameter. If neither is set, set the default value
+# to the new parameter.
+_check_conflict_and_set_default()
+{
+	local new_name="$1"
+	local old_name="$2"
+	local default_val="$3"
+	local new_name_checked="$new_name"_checked
+
+	if [[ -n ${!new_name_checked} ]]; then
+		return
+	fi
+
+	if [[ -n ${!old_name} ]]; then
+		if [[ -n ${!new_name} ]]; then
+			echo "Both ${old_name} and ${new_name} are specified"
+			exit 1
+		fi
+		eval "${new_name}=\"${!old_name}\""
+	elif [[ -z ${!new_name} ]]; then
+		eval "${new_name}=\"${default_val}\""
+	fi
+
+	eval "${new_name_checked}=true"
+}
+
+_io_uring_enable()
+{
+	# enable io_uring when it is disabled
+	IO_URING_DISABLED=0
+	if [ -f /proc/sys/kernel/io_uring_disabled ]; then
+		IO_URING_DISABLED=$(cat /proc/sys/kernel/io_uring_disabled)
+		if [ "$IO_URING_DISABLED" != 0 ]; then
+			echo 0 > /proc/sys/kernel/io_uring_disabled
+		fi
+	fi
+}
+_io_uring_restore()
+{
+	if [ "$IO_URING_DISABLED" != 0 ]; then
+		echo "$IO_URING_DISABLED" > /proc/sys/kernel/io_uring_disabled
+	fi
+}
+
+# get real device path name by following link
+_real_dev()
+{
+	local dev=$1
+	if [ -b "$dev" ] && [ -L "$dev" ]; then
+		dev=$(readlink -f "$dev")
+	fi
+	echo "$dev"
+}
+
+_min() {
+	local ret
+
+	for arg in "$@"; do
+		if [ -z "$ret" ] || (( arg < ret )); then
+			ret="$arg"
+		fi
+	done
+	echo "$ret"
+}

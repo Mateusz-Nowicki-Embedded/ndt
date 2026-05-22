@@ -1,0 +1,1236 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+#
+# nvme helper functions.
+
+. common/shellcheck
+
+def_traddr="127.0.0.1"
+def_adrfam="ipv4"
+def_trsvcid="4420"
+def_anagrpid="1"
+def_anastate="optimized"
+def_remote_wwnn="0x10001100ab000001"
+def_remote_wwpn="0x20001100ab000001"
+def_local_wwnn="0x10001100aa000001"
+def_local_wwpn="0x20001100aa000001"
+def_hostid="0f01fb42-9f7f-4856-b0b3-51e60b8de349"
+def_hostnqn="nqn.2014-08.org.nvmexpress:uuid:${def_hostid}"
+export def_subsysnqn="blktests-subsystem-1"
+export def_subsys_uuid="91fdba0d-f87b-4c25-b80f-db7be1418b9e"
+export def_nsid="1"
+_check_conflict_and_set_default NVMET_TRTYPES nvme_trtype "loop"
+_check_conflict_and_set_default NVME_IMG_SIZE nvme_img_size 1G
+_check_conflict_and_set_default NVME_NUM_ITER nvme_num_iter 1000
+nvmet_blkdev_type=${nvmet_blkdev_type:-"device"}
+NVMET_BLKDEV_TYPES=${NVMET_BLKDEV_TYPES:-"device file"}
+nvme_target_control="${NVME_TARGET_CONTROL:-}"
+NVMET_CFS="/sys/kernel/config/nvmet"
+# shellcheck disable=SC2034
+NVMET_DFS="/sys/kernel/debug/nvmet"
+nvme_trtype=${nvme_trtype:-}
+nvme_adrfam=${nvme_adrfam:-}
+
+# TMPDIR can not be referred out of test() or test_device() context. Instead of
+# global variable def_flie_path, use this getter function.
+_nvme_def_file_path() {
+	echo "${TMPDIR}/img"
+}
+
+_require_nvme_trtype() {
+	local trtype
+	for trtype in "$@"; do
+		if [[ "${nvme_trtype}" == "$trtype" ]]; then
+			return 0
+		fi
+	done
+	SKIP_REASONS+=("nvme_trtype=${nvme_trtype} is not supported in this test")
+	return 1
+}
+
+_require_nvme_trtype_is_loop() {
+	if ! _require_nvme_trtype loop; then
+		return 1
+	fi
+	return 0
+}
+
+_require_nvme_trtype_is_fabrics() {
+	if ! _require_nvme_trtype loop fc rdma tcp; then
+		return 1
+	fi
+	return 0
+}
+
+_have_nvme_cli_with_json_support() {
+	_have_program nvme || return $?
+
+	if ! nvme list --help 2>&1 | grep -q json; then
+		SKIP_REASONS+=("nvme-cli does not support json output format")
+		return 1
+	fi
+	return 0
+}
+
+_nvme_fcloop_add_rport() {
+	local local_wwnn="$1"
+	local local_wwpn="$2"
+	local remote_wwnn="$3"
+	local remote_wwpn="$4"
+	local loopctl=/sys/class/fcloop/ctl
+
+	echo "wwnn=${remote_wwnn},wwpn=${remote_wwpn},lpwwnn=${local_wwnn},lpwwpn=${local_wwpn},roles=0x60" > ${loopctl}/add_remote_port
+}
+
+_nvme_fcloop_add_lport() {
+	local wwnn="$1"
+	local wwpn="$2"
+	local loopctl=/sys/class/fcloop/ctl
+
+	echo "wwnn=${wwnn},wwpn=${wwpn}" > ${loopctl}/add_local_port
+}
+
+_nvme_fcloop_add_tport() {
+	local wwnn="$1"
+	local wwpn="$2"
+	local loopctl=/sys/class/fcloop/ctl
+
+	echo "wwnn=${wwnn},wwpn=${wwpn}" > ${loopctl}/add_target_port
+}
+
+_nvme_fcloop_del_rport() {
+	local local_wwnn="$1"
+	local local_wwpn="$2"
+	local remote_wwnn="$3"
+	local remote_wwpn="$4"
+	local loopctl=/sys/class/fcloop/ctl
+
+	if [[ ! -f "${loopctl}/del_remote_port" ]]; then
+		return
+	fi
+	echo "wwnn=${remote_wwnn},wwpn=${remote_wwpn}" > "${loopctl}/del_remote_port"
+}
+
+_nvme_fcloop_del_lport() {
+	local wwnn="$1"
+	local wwpn="$2"
+	local loopctl=/sys/class/fcloop/ctl
+
+	if [[ ! -f "${loopctl}/del_local_port" ]]; then
+		return
+	fi
+	echo "wwnn=${wwnn},wwpn=${wwpn}" > "${loopctl}/del_local_port"
+}
+
+_nvme_fcloop_del_tport() {
+	local wwnn="$1"
+	local wwpn="$2"
+	local loopctl=/sys/class/fcloop/ctl
+
+	if [[ ! -f "${loopctl}/del_target_port" ]]; then
+		return
+	fi
+	echo "wwnn=${wwnn},wwpn=${wwpn}" > "${loopctl}/del_target_port"
+}
+
+_cleanup_blkdev() {
+	local blkdev
+	local dev
+
+	blkdev="$(losetup -l | awk '$6 == "'"$(_nvme_def_file_path)"'" { print $1 }')"
+	for dev in ${blkdev}; do
+		losetup -d "${dev}"
+	done
+	rm -f "$(_nvme_def_file_path)"
+}
+
+_cleanup_nvmet() {
+	local dev
+	local port
+	local subsys
+	local transport
+	local name
+
+	if [[ ! -d "${NVMET_CFS}" ]]; then
+		return 0
+	fi
+
+	# Don't let successive Ctrl-Cs interrupt the cleanup processes
+	trap '' SIGINT
+
+	shopt -s nullglob
+
+	for dev in /sys/class/nvme/nvme*; do
+		dev="$(basename "$dev")"
+		transport="$(cat "/sys/class/nvme/${dev}/transport" 2>/dev/null)"
+		if [[ "$transport" == "${nvme_trtype}" ]]; then
+			# if udev auto connect is enabled for FC we get false positives
+			if [[ "$transport" != "fc" ]]; then
+				echo "WARNING: Test did not clean up ${nvme_trtype} device: ${dev}"
+			fi
+			_nvme_disconnect_ctrl "${dev}" 2>/dev/null
+		fi
+	done
+
+	if [[ -n "${nvme_target_control}" ]]; then
+		return
+	fi
+
+	for port in "${NVMET_CFS}"/ports/*; do
+		name=$(basename "${port}")
+		echo "WARNING: Test did not clean up port: ${name}"
+		if [[ "${nvme_trtype}" == "fc" ]]; then
+			_nvme_fcloop_del_rport "${def_local_wwnn}" "${def_local_wwpn}" \
+					       "$(_remote_wwnn "$name")" \
+					       "$(_remote_wwpn "$name")"
+			_nvme_fcloop_del_tport "$(_remote_wwnn "$name")" \
+					       "$(_remote_wwpn "$name")"
+		fi
+		rm -f "${port}"/subsystems/*
+		rmdir "${port}"
+	done
+
+	for subsys in "${NVMET_CFS}"/subsystems/*; do
+		name=$(basename "${subsys}")
+		echo "WARNING: Test did not clean up subsystem: ${name}"
+		for ns in "${subsys}"/namespaces/*; do
+			rmdir "${ns}"
+		done
+		for allowed_host in "${subsys}"/allowed_hosts/*; do
+			rm -f "$allowed_host"
+		done
+		rmdir "${subsys}"
+	done
+
+	for host in "${NVMET_CFS}"/hosts/*; do
+		name=$(basename "${host}")
+		echo "WARNING: Test did not clean up host: ${name}"
+		rmdir "${host}"
+	done
+
+	shopt -u nullglob
+	trap SIGINT
+
+	if [[ "${nvme_trtype}" == "fc" ]]; then
+		_nvme_fcloop_del_lport "${def_local_wwnn}" "${def_local_wwpn}"
+	fi
+	if [[ "${nvme_trtype}" == "rdma" ]]; then
+		stop_soft_rdma
+	fi
+
+	_cleanup_blkdev
+}
+
+_setup_nvmet() {
+	_register_test_cleanup _cleanup_nvmet
+
+	if [[ -n "${nvme_target_control}" ]]; then
+		def_hostnqn="$(${nvme_target_control} config --show-hostnqn)"
+		def_hostid="$(${nvme_target_control} config --show-hostid)"
+		def_traddr="$(${nvme_target_control} config --show-traddr)"
+		def_trsvcid="$(${nvme_target_control} config --show-trsvid)"
+		def_subsys_uuid="$(${nvme_target_control} config --show-subsys-uuid)"
+		def_subsysnqn="$(${nvme_target_control} config --show-subsysnqn)"
+		return
+	fi
+
+	_load_module nvmet
+	if [[ "${nvme_trtype}" != "loop" ]]; then
+		_load_module nvmet-"${nvme_trtype}"
+	fi
+	_load_module nvme-"${nvme_trtype}"
+	if [[ "${nvme_trtype}" == "rdma" ]]; then
+		start_soft_rdma
+		for i in $(rdma_network_interfaces)
+		do
+			if [[ "${nvme_adrfam}" == "ipv6" ]]; then
+				ipv6_addr=$(get_ipv6_ll_addr "$i")
+				if [[ -n "${ipv6_addr}" ]]; then
+					def_traddr=${ipv6_addr}
+				fi
+			else
+				ipv4_addr=$(get_ipv4_addr "$i")
+				if [[ -n "${ipv4_addr}" ]]; then
+					def_traddr=${ipv4_addr}
+				fi
+			fi
+		done
+	fi
+	if [[ "${nvme_trtype}" = "fc" ]]; then
+		_load_module nvme-fcloop
+		_nvme_fcloop_add_lport "${def_local_wwnn}" "${def_local_wwpn}"
+	fi
+}
+
+_nvme_disconnect_ctrl() {
+	local ctrl="$1"
+
+	nvme disconnect --device "${ctrl}"
+}
+
+_nvme_connect_subsys() {
+	local subsysnqn="$def_subsysnqn"
+	local hostnqn="$def_hostnqn"
+	local hostid="$def_hostid"
+	local hostkey=""
+	local ctrlkey=""
+	local nr_io_queues=""
+	local nr_write_queues=""
+	local nr_poll_queues=""
+	local keep_alive_tmo=""
+	local reconnect_delay=""
+	local ctrl_loss_tmo=""
+	local no_wait=false
+	local no_wait_ns=false
+	local expect_failure=false
+	local hdr_digest=false
+	local data_digest=false
+	local tls=false
+	local concat=false
+	local port
+	local i
+	local -a ARGS
+	local ret=0
+
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+			--port)
+				port="$2"
+				shift 2
+				;;
+			--subsysnqn)
+				subsysnqn="$2"
+				shift 2
+				;;
+			--hostnqn)
+				hostnqn="$2"
+				shift 2
+				;;
+			--hostid)
+				hostid="$2"
+				shift 2
+				;;
+			--dhchap-secret)
+				hostkey="$2"
+				shift 2
+				;;
+			--dhchap-ctrl-secret)
+				ctrlkey="$2"
+				shift 2
+				;;
+			--nr-io-queues)
+				nr_io_queues="$2"
+				shift 2
+				;;
+			--nr-write-queues)
+				nr_write_queues="$2"
+				shift 2
+				;;
+			--nr-poll-queues)
+				nr_poll_queues="$2"
+				shift 2
+				;;
+			--keep-alive-tmo)
+				keep_alive_tmo="$2"
+				shift 2
+				;;
+			--reconnect-delay)
+				reconnect_delay="$2"
+				shift 2
+				;;
+			--ctrl-loss-tmo)
+				ctrl_loss_tmo="$2"
+				shift 2
+				;;
+			--no-wait)
+				no_wait=true
+				shift 1
+				;;
+			--no-wait-ns)
+				no_wait_ns=true
+				shift 1
+				;;
+			--expect-failure)
+				expect_failure=true
+				shift 1
+				;;
+			--hdr-digest)
+				hdr_digest=true
+				shift 1
+				;;
+			--data-digest)
+				data_digest=true
+				shift 1
+				;;
+			--tls)
+				tls=true
+				shift 1
+				;;
+			--concat)
+				concat=true
+				shift 1
+				;;
+			*)
+				echo "WARNING: unknown argument: $1"
+				shift
+				;;
+		esac
+	done
+
+	if [[ -n "${nvme_target_control}" && -z "${port}" ]]; then
+		ARGS+=(--transport "$(${nvme_target_control} config --show-trtype)")
+		ARGS+=(--traddr "${def_traddr}")
+		ARGS+=(--trsvcid "${def_trsvcid}")
+	else
+		if [[ -z "${port}" ]]; then
+			local ports
+
+			_get_nvmet_ports "${subsysnqn}" ports
+			port="${ports[0]##*/}"
+			if [[ -z "${port}" ]]; then
+				echo "WARNING: no port found"
+				return 1
+			fi
+		fi
+		_get_nvmet_port_params "${port}" ARGS
+	fi
+	ARGS+=(--nqn "${subsysnqn}")
+	ARGS+=(--hostnqn="${hostnqn}")
+	ARGS+=(--hostid="${hostid}")
+	if [[ -n "${hostkey}" ]]; then
+		ARGS+=(--dhchap-secret="${hostkey}")
+	fi
+	if [[ -n "${ctrlkey}" ]]; then
+		ARGS+=(--dhchap-ctrl-secret="${ctrlkey}")
+	fi
+	if [[ -n "${nr_io_queues}" ]]; then
+		ARGS+=(--nr-io-queues="${nr_io_queues}")
+	fi
+	if [[ -n "${nr_write_queues}" ]]; then
+		ARGS+=(--nr-write-queues="${nr_write_queues}")
+	fi
+	if [[ -n "${nr_poll_queues}" ]]; then
+		ARGS+=(--nr-poll-queues="${nr_poll_queues}")
+	fi
+	if [[ -n "${keep_alive_tmo}" ]]; then
+		ARGS+=(--keep-alive-tmo="${keep_alive_tmo}")
+	fi
+	if [[ -n "${reconnect_delay}" ]]; then
+		ARGS+=(--reconnect-delay="${reconnect_delay}")
+	fi
+	if [[ -n "${ctrl_loss_tmo}" ]]; then
+		ARGS+=(--ctrl-loss-tmo="${ctrl_loss_tmo}")
+	fi
+	if [[ ${hdr_digest} = true ]]; then
+		ARGS+=(--hdr-digest)
+	fi
+	if [[ ${data_digest} = true ]]; then
+		ARGS+=(--data-digest)
+	fi
+	if [[ ${tls} = true ]]; then
+		ARGS+=(--tls)
+	fi
+	if [[ ${concat} = true ]]; then
+		ARGS+=(--concat)
+	fi
+	ARGS+=(--output-format=json)
+	connect=$(nvme connect "${ARGS[@]}" 2> /dev/null)
+	ret=$?
+	if [[ ${expect_failure} = false ]]; then
+		if [[ ${ret} != 0 ]]; then
+			echo "FAIL: nvme connect return error code"
+		fi
+	else
+		if [[ ${ret} == 0 ]]; then
+			echo "FAIL: nvme connect did not return error code"
+		fi
+	fi
+
+	# Wait until device file and sysfs attributes get ready
+	if [[ ${no_wait} = false ]]; then
+		local ctrldev
+
+		ctrldev=$(echo "${connect}" | sed -n 's/.*device.:.\(nvme[0-9]*\)./\1/p')
+		udevadm settle
+		for ((i = 0; i < 10; i++)); do
+			_nvme_ctrl_ready "${ctrldev}" "${subsysnqn}" && break
+			sleep .1
+		done
+		[ $i -eq 10 ] && ret=1
+		if [[ ${no_wait_ns} = false ]]; then
+			for ((i = 0; i < 10; i++)); do
+				_nvme_ns_ready "${subsysnqn}" && break
+				sleep .1
+			done
+			[ $i -eq 10 ] && ret=2
+		fi
+
+	fi
+	return "$ret"
+}
+
+_nvme_disconnect_subsys() {
+	local subsysnqn="$def_subsysnqn"
+
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+			--subsysnqn)
+				subsysnqn="$2"
+				shift 2
+				;;
+			*)
+				echo "WARNING: unknown argument: $1"
+				shift
+				;;
+		esac
+	done
+
+	nvme disconnect --nqn "${subsysnqn}" |& tee -a "$FULL" |
+		grep -o "disconnected.*"
+}
+
+_nvme_ctrl_ready() {
+	local ctrldev="${1}"
+	local subsysnqn="${2:-$def_subsysnqn}"
+	local ctrlpath="/sys/class/nvme/${ctrldev}"
+
+	nqn=$(cat "${ctrlpath}/subsysnqn" 2> /dev/null)
+	if [[ "${nqn}" == "${subsysnqn}" &&
+		      -c /dev/${ctrldev} ]]; then
+		return 0
+	fi
+	return 1
+}
+
+_nvme_ns_ready() {
+	local subsysnqn="${1}"
+	local ns_path ns_id dev
+	local cfs_path="${NVMET_CFS}/subsystems/$subsysnqn"
+
+	dev=$(_find_nvme_dev "$subsysnqn")
+	for ns_path in "${cfs_path}/namespaces/"*; do
+		ns_id=${ns_path##*/}
+		if [[ ! -b /dev/${dev}n${ns_id} ||
+			! -e /sys/block/${dev}n${ns_id}/uuid ||
+			! -e /sys/block/${dev}n${ns_id}/wwid ]]; then
+			return 1
+		fi
+	done
+	return 0
+}
+
+_remote_wwnn() {
+	local -i port=${1}
+
+	printf "0x%08x" $(( def_remote_wwnn + port ))
+}
+
+_remote_wwpn() {
+	local -i port=${1}
+
+	printf "0x%08x" $(( def_remote_wwpn + port ))
+}
+
+_fc_traddr() {
+	printf "nn-%s:pn-%s" "$(_remote_wwnn "$1")" "$(_remote_wwpn "$1")"
+}
+
+_fc_host_traddr() {
+	printf "nn-%s:pn-%s" "$def_local_wwnn" "$def_local_wwpn"
+}
+
+_create_nvmet_port() {
+	local tls="${1:-none}"
+	local trtype="${nvme_trtype}"
+	local traddr="${def_traddr}"
+	local adrfam="${def_adrfam}"
+	local trsvcid="${def_trsvcid}"
+	local portcfs
+
+	local port
+	for ((port = 0; ; port++)); do
+		if [[ ! -e "${NVMET_CFS}/ports/${port}" ]]; then
+			break
+		fi
+	done
+
+	portcfs="${NVMET_CFS}/ports/${port}"
+	mkdir "${portcfs}"
+	if [[ "${trtype}" == "tcp" ]] || [[ "${trtype}" == "rdma" ]]; then
+		trsvcid=$(printf "%d" $(( trsvcid + port )) )
+	elif [[ "${trtype}" == "loop" ]]; then
+		traddr="${port}"
+		adrfam="loop"
+	elif [[ "${trtype}" == "fc" ]]; then
+		_nvme_fcloop_add_tport "$(_remote_wwnn $port)" \
+				       "$(_remote_wwpn $port)"
+		_nvme_fcloop_add_rport "$def_local_wwnn" "$def_local_wwpn" \
+				       "$(_remote_wwnn $port)" \
+				       "$(_remote_wwpn $port)"
+		traddr=$(_fc_traddr $port)
+		adrfam="fc"
+	fi
+	echo "${trtype}" > "${portcfs}/addr_trtype"
+	echo "${traddr}" > "${portcfs}/addr_traddr"
+	echo "${adrfam}" > "${portcfs}/addr_adrfam"
+	if [[ "${adrfam}" != "fc" ]] && \
+	   [[ "${adrfam}" != "loop" ]] ; then
+		echo "${trsvcid}" > "${portcfs}/addr_trsvcid"
+	fi
+	if [[ "${trtype}" == "tcp" ]] && \
+		   [[ "${tls}" != "none" ]]; then
+		echo "tls1.3" > "${portcfs}/addr_tsas"
+		if [[ "${tls}" != "required" ]]; then
+			echo "not required" > "${portcfs}/addr_treq"
+		fi
+	fi
+	echo "${port}"
+}
+
+_setup_nvmet_port_ana() {
+	local port="$1"
+	local anagrpid="${2:-$def_anagrpid}"
+	local anastate="${3:-$def_anastate}"
+	local cfsport="${NVMET_CFS}/ports/${port}"
+	local anaport="${cfsport}/ana_groups/${anagrpid}"
+
+	if [[ ! -d "${anaport}" ]] ; then
+		if [[ "${anagrpid}" -eq 1 ]]; then
+			echo "FAIL target setup failed, ANA not supported"
+			exit 1
+		fi
+		mkdir "${anaport}"
+	fi
+	echo "${anastate}" > "${anaport}/ana_state"
+}
+
+_remove_nvmet_port() {
+	local port="$1"
+	local cfsport="${NVMET_CFS}/ports/${port}"
+	local a
+
+	if [[ "${nvme_trtype}" == "fc" ]]; then
+		_nvme_fcloop_del_tport "$(_remote_wwnn "$port")" \
+				       "$(_remote_wwpn "$port")"
+		_nvme_fcloop_del_rport "$def_local_wwnn" "$def_local_wwpn" \
+				       "$(_remote_wwnn "$port")" \
+				       "$(_remote_wwpn "$port")"
+	fi
+	for a in "${cfsport}/ana_groups/"*; do
+		[[ "${a##*/}" == "1" ]] && continue
+		rmdir "${a}"
+	done
+	rmdir "${cfsport}"
+}
+
+# Wait for the namespace with specified uuid to fulfill the specified condtion,
+# "created" or "removed".
+_nvmf_wait_for_ns() {
+	local ns
+	local timeout="5"
+	local uuid="$1"
+	local condition="$2"
+
+	ns=$(_find_nvme_ns "${uuid}" 2>> "$FULL")
+
+	start_time=$(date +%s)
+	while [[ -z "$ns" && "$condition" == created ]] ||
+		      [[ -n "$ns" && "$condition" == removed ]]; do
+		sleep .1
+		end_time=$(date +%s)
+		if (( end_time - start_time > timeout )); then
+			echo "namespace with uuid \"${uuid}\" not " \
+			     "${condition} within ${timeout} seconds"
+			return 1
+		fi
+		ns=$(_find_nvme_ns "${uuid}" 2>> "$FULL")
+	done
+
+	return 0
+}
+
+_nvmf_wait_for_state() {
+	local def_state_timeout=5
+	local subsys_name="$1"
+	local state="$2"
+	local timeout="${3:-$def_state_timeout}"
+	local nvmedev
+	local state_file
+	local start_time
+	local end_time
+
+	nvmedev=$(_find_nvme_dev "${subsys_name}")
+	state_file="/sys/class/nvme-fabrics/ctl/${nvmedev}/state"
+
+	start_time=$(date +%s)
+	while ! grep -q "${state}" "${state_file}"; do
+		sleep 1
+		end_time=$(date +%s)
+		if (( end_time - start_time > timeout )); then
+			echo "expected state \"${state}\" not " \
+				"reached within ${timeout} seconds"
+			return 1
+		fi
+	done
+
+	return 0
+}
+
+_create_nvmet_ns() {
+	local subsysnqn="${def_subsysnqn}"
+	local nsid="${def_nsid}"
+	local grpid="1"
+	local blkdev
+	local uuid
+	local subsys_path
+	local ns_path
+	local resv_enable=false
+
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+			--subsysnqn)
+				subsysnqn="$2"
+				shift 2
+				;;
+			--nsid)
+				nsid="$2"
+				shift 2
+				;;
+			--blkdev)
+				blkdev="$2"
+				shift 2
+				;;
+			--uuid)
+				uuid="$2"
+				shift 2
+				;;
+			--resv_enable)
+				resv_enable=true
+				shift 1
+				;;
+			--grpid)
+				grpid="$2"
+				shift 2
+				;;
+			*)
+				echo "WARNING: unknown argument: $1"
+				shift
+				;;
+		esac
+	done
+
+	subsys_path="${NVMET_CFS}/subsystems/${subsysnqn}"
+	ns_path="${subsys_path}/namespaces/${nsid}"
+	mkdir "${ns_path}"
+	printf "%s" "${blkdev}" > "${ns_path}/device_path"
+	if [[ -f "${ns_path}/resv_enable" && "${resv_enable}" = true ]] ; then
+		printf 1 > "${ns_path}/resv_enable"
+	fi
+	if [[ -n "${uuid}" ]]; then
+		printf "%s" "${uuid}" > "${ns_path}/device_uuid"
+	else
+		uuid=$(cat "${ns_path}/device_uuid")
+	fi
+	if (( grpid != 1 )); then
+		printf "%d" "${grpid}" > "${ns_path}/ana_grpid"
+	fi
+	printf 1 > "${ns_path}/enable"
+	echo "${uuid}"
+}
+
+_setup_nvmet_ns_ana() {
+	local nvmet_subsystem="$1"
+	local nsid="$2"
+	local anagrpid="${3:-def_anagrpid}"
+	local subsys_path="${NVMET_CFS}/subsystems/${nvmet_subsystem}"
+	local ns_path="${subsys_path}/namespaces/${nsid}"
+
+	if [[ ! -d "${ns_path}" ]]; then
+		return
+	fi
+	echo "${anagrpid}" > "${ns_path}/anagrpid"
+}
+
+_create_nvmet_subsystem() {
+	local subsystem="${def_subsysnqn}"
+	local blkdev
+	local uuid="${def_subsys_uuid}"
+	local resv_enable
+	local cfs_path
+	local -a ARGS
+
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+			--subsysnqn)
+				subsystem="$2"
+				shift 2
+				;;
+			--blkdev)
+				blkdev="$2"
+				shift 2
+				;;
+			--uuid)
+				uuid="$2"
+				shift 2
+				;;
+			--resv_enable)
+				resv_enable="--resv_enable";
+				shift 1
+				;;
+			*)
+				echo "WARNING: unknown argument: $1"
+				shift
+				;;
+		esac
+	done
+
+	cfs_path="${NVMET_CFS}/subsystems/${subsystem}"
+	mkdir -p "${cfs_path}"
+	echo 0 > "${cfs_path}/attr_allow_any_host"
+	if [[ -z "${blkdev}" ]]; then
+		return 0
+	fi
+	ARGS+=(--subsysnqn "${subsystem}")
+	ARGS+=(--blkdev "${blkdev}")
+	if [[ -n "$uuid" ]]; then
+		ARGS+=(--uuid "${uuid}")
+	fi
+	if [[ -n "$resv_enable" ]]; then
+		ARGS+=("${resv_enable}")
+	fi
+	_create_nvmet_ns "${ARGS[@]}" > /dev/null
+}
+
+_add_nvmet_allow_hosts() {
+	local nvmet_subsystem="$1"
+	local nvmet_hostnqn="$2"
+	local cfs_path="${NVMET_CFS}/subsystems/${nvmet_subsystem}"
+	local host_path="${NVMET_CFS}/hosts/${nvmet_hostnqn}"
+
+	ln -s "${host_path}" "${cfs_path}/allowed_hosts/${nvmet_hostnqn}"
+}
+
+_create_nvmet_host() {
+	local nvmet_subsystem="$1"
+	local nvmet_hostnqn="$2"
+	local nvmet_hostkey="$3"
+	local nvmet_ctrlkey="$4"
+	local host_path="${NVMET_CFS}/hosts/${nvmet_hostnqn}"
+
+	if [[ -d "${host_path}" ]]; then
+		echo "FAIL target setup failed. stale host configuration found"
+		return 1;
+	fi
+
+	mkdir "${host_path}"
+	_add_nvmet_allow_hosts "${nvmet_subsystem}" "${nvmet_hostnqn}"
+	if [[ "${nvmet_hostkey}" ]] ; then
+		echo "${nvmet_hostkey}" > "${host_path}/dhchap_key"
+	fi
+	if [[ "${nvmet_ctrlkey}" ]] ; then
+		echo "${nvmet_ctrlkey}" > "${host_path}/dhchap_ctrl_key"
+	fi
+}
+
+_remove_nvmet_ns() {
+	local nvmet_subsystem="$1"
+	local nsid=$2
+	local subsys_path="${NVMET_CFS}/subsystems/${nvmet_subsystem}"
+	local nvmet_ns_path="${subsys_path}/namespaces/${nsid}"
+
+	echo 0 > "${nvmet_ns_path}/enable"
+	rmdir "${nvmet_ns_path}"
+}
+
+_remove_nvmet_subsystem() {
+	local nvmet_subsystem="$1"
+	local subsys_path="${NVMET_CFS}/subsystems/${nvmet_subsystem}"
+
+	for n in "${subsys_path}/namespaces/"*; do
+		[ -d "${n}" ] || continue
+		_remove_nvmet_ns "${nvmet_subsystem}" "${n##*/}"
+	done
+	rm -f "${subsys_path}"/allowed_hosts/*
+	rmdir "${subsys_path}"
+}
+
+_remove_nvmet_host() {
+	local nvmet_host="$1"
+	local host_path="${NVMET_CFS}/hosts/${nvmet_host}"
+
+	rmdir "${host_path}"
+}
+
+_add_nvmet_subsys_to_port() {
+	local port="$1"
+	local nvmet_subsystem="$2"
+
+	ln -s "${NVMET_CFS}/subsystems/${nvmet_subsystem}" \
+		"${NVMET_CFS}/ports/${port}/subsystems/${nvmet_subsystem}"
+}
+
+_remove_nvmet_subsystem_from_port() {
+	local port="$1"
+	local nvmet_subsystem="$2"
+
+	rm "${NVMET_CFS}/ports/${port}/subsystems/${nvmet_subsystem}"
+}
+
+_get_nvmet_ports() {
+	local nvmet_subsysnqn="${1:-$def_subsysnqn}"
+	local -n nvmet_ports="$2"
+	local cfs_path="${NVMET_CFS}/ports"
+
+	for port in "${cfs_path}/"*; do
+		if [[ -e "${port}/subsystems/${nvmet_subsysnqn}" ]]; then
+			nvmet_ports+=("${port##*/}")
+		fi
+	done
+}
+
+_get_nvmet_port_params() {
+	local port="$1"
+	local -n args="$2"
+	local cfs_path="${NVMET_CFS}/ports/${port}"
+	local trtype="${nvme_trtype}"
+	local traddr
+	local trsvcid="${def_trsvcid}"
+
+	# When port is specified, get port dependent parameter values
+	if [[ $port != none ]]; then
+		[[ -d "${cfs_path}" ]] || exit 1
+		trtype=$(cat "${cfs_path}/addr_trtype")
+		traddr=$(cat "${cfs_path}/addr_traddr")
+		args+=(--traddr "${traddr}")
+		if [[ "${trtype}" == "tcp" ]] || [[ "${trtype}" == "rdma" ]]; then
+			trsvcid=$(cat "${cfs_path}/addr_trsvcid")
+		fi
+	fi
+
+	# Prepare parameter options
+	args+=(--transport "${trtype}")
+	case ${trtype} in
+	loop)
+		;;
+	rdma | tcp)
+		if [[ $port == none ]]; then
+			args+=(--traddr "${def_traddr}")
+		fi
+		args+=(--trsvcid "${trsvcid}")
+		;;
+	fc)
+		args+=(--traddr "$(_fc_traddr "$port")")
+		args+=(--host-traddr "$(_fc_host_traddr "$port")")
+		;;
+	*)
+		echo Unexpected transport type: "${trtype}"
+		exit
+		;;
+	esac
+}
+
+_find_nvme_dev() {
+	local subsys=$1
+	local subsysnqn
+	local dev
+	for dev in /sys/class/nvme/nvme*; do
+		[ -e "$dev" ] || continue
+		dev="$(basename "$dev")"
+		subsysnqn="$(cat "/sys/class/nvme/${dev}/subsysnqn" 2>/dev/null)"
+		if [[ "$subsysnqn" == "$subsys" ]]; then
+			echo "$dev"
+			return 0
+		fi
+	done
+	return 1
+}
+
+_find_nvme_ns() {
+	local subsys_uuid=$1
+	local uuid
+	local ns
+
+	for ns in "/sys/block/nvme"* ; do
+		# ignore nvme channel block devices
+		if ! [[ "${ns}" =~ nvme[0-9]+n[0-9]+ ]]; then
+			continue
+		fi
+		[ -e "${ns}/uuid" ] || continue
+		uuid=$(cat "${ns}/uuid")
+		if [[ "${subsys_uuid}" == "${uuid}" ]]; then
+			basename "${ns}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+_nvmet_target_setup() {
+	local blkdev_type="${nvmet_blkdev_type}"
+	local blkdev
+	local ctrlkey=""
+	local hostkey=""
+	local subsysnqn="${def_subsysnqn}"
+	local subsys_uuid
+	local port p
+	local resv_enable=""
+	local num_ports=1
+	local tls="none"
+	local -a ARGS
+
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+			--blkdev)
+				blkdev_type="$2"
+				shift 2
+				;;
+			--ctrlkey)
+				ctrlkey="$2"
+				shift 2
+				;;
+			--hostkey)
+				hostkey="$2"
+				shift 2
+				;;
+			--subsysnqn)
+				subsysnqn="$2"
+				shift 2
+				;;
+			--subsys-uuid)
+				subsys_uuid="$2"
+				shift 2
+				;;
+			--resv_enable)
+				resv_enable="--resv_enable"
+				shift 1
+				;;
+			--ports)
+				num_ports="$2"
+				shift 2
+				;;
+			--tls)
+				tls="not-required"
+				shift 1
+				;;
+			--force-tls)
+				tls="required"
+				shift 1
+				;;
+			*)
+				echo "WARNING: unknown argument: $1"
+				shift
+				;;
+		esac
+	done
+
+	if [[ "${blkdev_type}" != "none" ]]; then
+		truncate -s "${NVME_IMG_SIZE}" "$(_nvme_def_file_path)"
+		if [[ "${blkdev_type}" == "device" ]]; then
+			blkdev="$(losetup -f --show "$(_nvme_def_file_path)")"
+		else
+			blkdev="$(_nvme_def_file_path)"
+		fi
+	fi
+
+	if [[ -n "${nvme_target_control}" ]]; then
+		if [[ -n "${hostkey}" ]]; then
+			ARGS+=(--hostkey "${hostkey}")
+		fi
+		if [[ -n "${ctrlkey}" ]]; then
+			ARGS+=(--ctrkey "${ctrlkey}")
+		fi
+
+		"${nvme_target_control}" setup \
+					 --subsysnqn "${subsysnqn}" \
+					 --subsys-uuid "${subsys_uuid:-$def_subsys_uuid}" \
+					 --hostnqn "${def_hostnqn}" \
+					 "${ARGS[@]}" &> /dev/null
+		return
+	fi
+
+	ARGS=(--subsysnqn "${subsysnqn}")
+	if [[ -n "${blkdev}" ]]; then
+		ARGS+=(--blkdev "${blkdev}")
+	fi
+	if [[ -n "${subsys_uuid}" ]]; then
+		ARGS+=(--uuid "${subsys_uuid}")
+	fi
+	if [[ -n "${resv_enable}" ]]; then
+		ARGS+=("${resv_enable}")
+	fi
+	_create_nvmet_subsystem "${ARGS[@]}"
+
+	p=0
+	while (( p < num_ports )); do
+		port="$(_create_nvmet_port ${tls})"
+		_add_nvmet_subsys_to_port "${port}" "${subsysnqn}"
+		p=$(( p + 1 ))
+	done
+	_create_nvmet_host "${subsysnqn}" "${def_hostnqn}" \
+			"${hostkey}" "${ctrlkey}"
+}
+
+_nvmet_target_cleanup() {
+	local ports
+	local port
+	local blkdev
+	local subsysnqn="${def_subsysnqn}"
+	local blkdev_type=""
+
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+			--blkdev)
+				blkdev_type="$2"
+				shift 2
+				;;
+			--subsysnqn)
+				subsysnqn="$2"
+				shift 2
+				;;
+			*)
+				echo "WARNING: unknown argument: $1"
+				shift
+				;;
+		esac
+	done
+
+	if [[ -n "${nvme_target_control}" ]]; then
+		"${nvme_target_control}" cleanup \
+			--subsysnqn "${subsysnqn}" \
+			> /dev/null
+		return
+	fi
+
+	_get_nvmet_ports "${subsysnqn}" ports
+
+	for port in "${ports[@]}"; do
+		_remove_nvmet_subsystem_from_port "${port}" "${subsysnqn}"
+		_remove_nvmet_port "${port}"
+	done
+	_remove_nvmet_subsystem "${subsysnqn}"
+	_remove_nvmet_host "${def_hostnqn}"
+
+	if [[ "${blkdev_type}" == "device" ]]; then
+		_cleanup_blkdev
+	fi
+}
+
+_test_dev_is_nvme() {
+	readlink --canonicalize "$TEST_DEV_SYSFS/device" | grep --quiet nvme
+}
+
+_require_test_dev_is_nvme() {
+	if ! _test_dev_is_nvme; then
+		SKIP_REASONS+=("$TEST_DEV is not a NVMe device")
+		return 1
+	fi
+	return 0
+}
+
+_test_dev_has_metadata() {
+	if [ ! -e "${TEST_DEV_SYSFS}/metadata_bytes" ] || \
+		   (( ! $(<"${TEST_DEV_SYSFS}/metadata_bytes") )); then
+		SKIP_REASONS+=("$TEST_DEV does not have metadata")
+		return 1
+	fi
+	return 0
+}
+
+_test_dev_has_no_metadata() {
+	if [ -e "${TEST_DEV_SYSFS}/metadata_bytes" ] &&
+		   (( $(<"${TEST_DEV_SYSFS}/metadata_bytes") )); then
+		SKIP_REASONS+=("$TEST_DEV has metadata")
+		return 1
+	fi
+	return 0
+}
+
+_test_dev_disables_extended_lba() {
+	local flbas
+
+	if ! _test_dev_is_nvme || ! flbas=$(nvme id-ns "$TEST_DEV" | \
+	   grep flbas | sed --quiet 's/.*: \(.*\)/\1/p'); then
+		SKIP_REASONS+=("$TEST_DEV does not have namespace flbas field")
+		return 1
+	fi
+	if (( flbas & 0x10 )); then
+		SKIP_REASONS+=("$TEST_DEV enables NVME_NS_FLBAS_META_EXT")
+		return 1
+	fi
+	return 0
+}
+
+_require_nvme_test_img_size() {
+	local require_sz_mb
+	local nvme_img_size_mb
+
+	require_sz_mb="$(convert_to_mb "$1")"
+	nvme_img_size_mb="$(convert_to_mb "${NVME_IMG_SIZE}")"
+
+	if ((nvme_img_size_mb < require_sz_mb)); then
+		SKIP_REASONS+=("NVME_IMG_SIZE must be at least ${require_sz_mb}m")
+		return 1
+	fi
+	return 0
+}
+
+_nvme_requires() {
+	_require_nvme_test_img_size 4m
+	case ${nvme_trtype} in
+	loop)
+		_have_driver nvme-loop
+		_have_configfs
+		;;
+	pci)
+		_have_driver nvme
+		;;
+	tcp)
+		_have_driver nvme-tcp
+		_have_driver nvmet-tcp
+		_have_configfs
+		def_adrfam="ipv4"
+		;;
+	rdma)
+		_have_driver nvme-rdma
+		_have_driver nvmet-rdma
+		_have_configfs
+		_have_program rdma
+		if [ -n "$USE_RXE" ]; then
+			_have_driver rdma_rxe
+		else
+			_have_driver siw
+		fi
+		def_adrfam="ipv4"
+		;;
+	fc)
+		_have_driver nvme-fc
+		_have_driver nvme-fcloop
+		_have_configfs
+		def_adrfam="fc"
+		;;
+	esac
+
+	if [[ -n ${nvme_adrfam} ]]; then
+		case ${nvme_adrfam} in
+		ipv6)
+			def_traddr="::1"
+			def_adrfam="ipv6"
+			;;
+		ipv4)
+			def_adrfam="ipv4"
+			;;
+		fc)
+			def_adrfam="fc"
+			;;
+		*)
+			# ignore for non ip transports
+			if [[ "${nvme_trtype}" == "tcp" ||
+			      "${nvme_trtype}" == "rdma" ]]; then
+				SKIP_REASONS+=("unsupported nvme_adrfam=${nvme_adrfam}")
+				return 1
+			fi
+		esac
+	fi
+
+	return 0
+}

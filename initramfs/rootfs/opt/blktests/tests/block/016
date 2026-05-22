@@ -1,0 +1,49 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2018 Omar Sandoval
+#
+# Test a nasty case where receiving a signal while waiting for a frozen
+# request_queue would result in EIO. Regression test for 1dc3039bc87a ("block:
+# do not use interruptible wait anywhere").
+
+. tests/block/rc
+. common/null_blk
+
+DESCRIPTION="send a signal to a process waiting on a frozen queue"
+QUICK=1
+CAN_BE_ZONED=1
+
+requires() {
+	_have_null_blk
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	if ! _configure_null_blk nullb1 irqmode=2 completion_nsec=2000000000 \
+			power=1; then
+		return 1
+	fi
+
+	# Start an I/O, which will take two seconds.
+	dd if=/dev/nullb1 of=/dev/null bs=512 iflag=direct count=1 status=none &
+	sleep 0.5
+
+	# This will freeze the queue, and since we have an I/O in flight, it
+	# will stay frozen until the I/O completes.
+	echo 64 > /sys/block/nullb1/queue/nr_requests &
+	sleep 0.5
+
+	# Do an I/O, which will wait for the queue to unfreeze.
+	dd if=/dev/nullb1 of=/dev/null bs=512 iflag=direct count=1 status=none &
+	sleep 0.5
+
+	# While dd is blocked, send a signal which we know dd has a handler
+	# for.
+	kill -USR1 $!
+	wait
+
+	_exit_null_blk
+
+	echo "Test complete"
+}

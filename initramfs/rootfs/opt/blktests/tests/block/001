@@ -1,0 +1,62 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+#
+# Stress test device hotplugging. Deletes and rescans several scsi-debug
+# devices in parallel. Regression test for commit 165a5e22fafb ("block: Move
+# bdi_unregister() to del_gendisk()").
+
+. tests/block/rc
+. common/scsi_debug
+
+DESCRIPTION="stress device hotplugging"
+TIMED=1
+
+requires() {
+	_have_scsi_debug
+	_have_kernel_option BLK_DEV_SD
+	_have_driver sr_mod
+}
+
+stress_scsi_debug() {
+	if ! _configure_scsi_debug "$@"; then
+		return
+	fi
+
+	local host target
+	for target in "${SCSI_DEBUG_TARGETS[@]}"; do
+		(
+		host="${target%%:*}"
+		scan="${target#*:}"
+		scan="${scan//:/ }"
+		while [[ ! -e "$TMPDIR/stop" ]]; do
+			echo "${scan}" > "/sys/class/scsi_host/host${host}/scan"
+			while [[ ! -d "/sys/class/scsi_device/${target}" ]]; do
+				sleep 0.01
+			done
+			echo 1 > "/sys/class/scsi_device/${target}/device/delete"
+		done
+		) &
+	done
+	sleep "$TIMEOUT"
+	touch "$TMPDIR/stop"
+	wait
+	rm -f "$TMPDIR/stop"
+
+	_exit_scsi_debug
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	: "${TIMEOUT:=30}"
+	_divide_timeout 2
+
+	echo "Stressing sd"
+	stress_scsi_debug add_host=4 num_tgts=1 ptype=0
+
+	echo "Stressing sr"
+	stress_scsi_debug add_host=4 num_tgts=1 ptype=5
+
+	echo "Test complete"
+}

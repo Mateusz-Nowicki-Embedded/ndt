@@ -1,0 +1,32 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Jens Axboe
+#
+# Run a range of discards on a device, anywhere from 4k to 4g
+
+. tests/block/rc
+
+DESCRIPTION="run various discard sizes"
+TIMED=1
+
+requires() {
+	_have_fio
+}
+
+device_requires() {
+	_require_test_dev_can_discard
+}
+
+test_device() {
+	local test_dev_bs
+
+	test_dev_bs=$(_min_io "$TEST_DEV")
+
+	echo "Running ${TEST_NAME}"
+
+	FIO_PERF_FIELDS=("trim iops")
+	_fio_perf --bsrange="${test_dev_bs}"-4g --rw=randtrim --norandommap --name=discards \
+		--filename="$TEST_DEV" --number_ios=200k
+
+	echo "Test complete"
+}

@@ -1,0 +1,98 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Johannes Thumshirn <jthumshirn@suse.de>
+#
+# Do disable PCI device while doing I/O to it
+
+. tests/block/rc
+
+DESCRIPTION="disable PCI device while doing I/O"
+TIMED=1
+CAN_BE_ZONED=1
+
+pci_dev_mounted() {
+	local d dev p pdev
+
+	pdev="$(_get_pci_dev_from_blkdev)"
+	for d in /sys/block/*; do
+		dev=${d##*/}
+		p=$(_get_pci_from_dev_sysfs "$d")
+		[[ $p != "$pdev" ]] && continue
+		grep -qe "/dev/$dev" /proc/mounts && return 0
+	done
+	return 1
+}
+
+requires() {
+	_have_fio
+	_have_program setpci
+}
+
+device_requires() {
+	_require_test_dev_is_pci
+	if pci_dev_mounted; then
+		SKIP_REASONS+=("mounted block device exists on test target PCI device")
+		return 1
+	fi
+}
+
+test_device() {
+	echo "Running ${TEST_NAME}"
+
+	local pdev size rescan=false state i
+
+	pdev="$(_get_pci_dev_from_blkdev)"
+
+	if _test_dev_is_rotational; then
+		size="32m"
+	else
+		size="1g"
+	fi
+
+	# start fio job
+	: "${TIMEOUT:=1200}"
+	_run_fio_rand_io --filename="$TEST_DEV" --size="$size" \
+			--ignore_error=EIO,ENXIO,ENODEV &
+
+	# toggle PCI Command Register's Bus Master Enabling
+	while kill -0 $! 2>/dev/null; do
+		setpci -s "${pdev}" 4.w=0:4
+		sleep .2
+		setpci -s "${pdev}" 4.w=4:4
+		sleep .2
+	done
+
+	echo "Test complete"
+
+	# This test triggers NVME controller resets. When failures happen during
+	# the resets, the driver marks the NVME block devices as zero capacity.
+	# Remove and rescan the devices to regain the correct capacity.
+	if ((!$(<"$TEST_DEV_SYSFS/size"))); then
+		echo "$TEST_DEV has zero capacity. Rescan it." >> "$FULL"
+		rescan=true
+	fi
+
+	# This test case often makes NVME or HDDs connected to HBAs in offline
+	# or dead mode. Remove and rescan the devices to make them online again.
+	if state=$({ cat "$TEST_DEV_SYSFS/device/state"; } 2>/dev/null); then
+		if [[ $state == offline || $state == dead ]]; then
+			echo "$TEST_DEV is $state. Rescan it." >> "$FULL"
+			rescan=true
+		fi
+	fi
+
+	if [[ $rescan == true ]]; then
+		if [[ -w /sys/bus/pci/devices/$pdev/remove ]] &&
+			   [[ -w /sys/bus/pci/rescan ]]; then
+			echo 1 > "/sys/bus/pci/devices/$pdev/remove"
+			echo 1 > /sys/bus/pci/rescan
+		else
+			echo "Can not rescan PCI device for recovery"
+			return 1
+		fi
+		for ((i = 0; i < 10; i++)); do
+			[[ -w $TEST_DEV ]] && break
+			sleep 5
+		done
+	fi
+}

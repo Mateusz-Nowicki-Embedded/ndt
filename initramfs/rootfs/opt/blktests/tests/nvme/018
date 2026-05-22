@@ -1,0 +1,50 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2018 Sagi Grimberg
+#
+# Test NVMe out of range access on a file backend. Regression test for commit
+# 9c891c139894 ("nvmet: check fileio LBA range access boundaries").
+
+. tests/nvme/rc
+
+DESCRIPTION="unit test NVMe-oF out of range access on a file backend"
+QUICK=1
+
+requires() {
+	_nvme_requires
+	_have_loop
+	_require_nvme_trtype_is_fabrics
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	_setup_nvmet
+
+	local ns
+	local sectors
+	local bs
+
+	_nvmet_target_setup --blkdev file
+
+	_nvme_connect_subsys
+
+	ns=$(_find_nvme_ns "${def_subsys_uuid}")
+
+	sectors="$(blockdev --getsz "/dev/${ns}")"
+	bs="$(blockdev --getbsz "/dev/${ns}")"
+
+	nvme read "/dev/${ns}" --start-block "$sectors" \
+		--block-count 0 --data-size "$bs" &>"$FULL" \
+		&& echo "ERROR: nvme read for out of range LBA was not rejected"
+
+	_nvme_disconnect_subsys
+
+	_nvmet_target_cleanup
+
+	echo "Test complete"
+}

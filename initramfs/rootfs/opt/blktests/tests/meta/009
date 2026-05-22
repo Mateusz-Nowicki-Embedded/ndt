@@ -1,0 +1,19 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+#
+# Test checking dmesg.
+
+. tests/meta/rc
+
+DESCRIPTION="check dmesg"
+
+requires() {
+	_have_writeable_kmsg
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+	fake_bug_on
+	echo "Test complete"
+}

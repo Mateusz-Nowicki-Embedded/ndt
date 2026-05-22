@@ -1,0 +1,42 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Jens Axboe
+#
+# Run a flush intensive workload
+
+. tests/block/rc
+
+DESCRIPTION="run lots of flushes"
+TIMED=1
+CAN_BE_ZONED=1
+
+requires() {
+	_have_fio
+}
+
+device_requires() {
+	if _test_dev_is_zoned; then
+		_have_fio_zbd_zonemode
+		_have_program blkzone
+	fi
+}
+
+test_device() {
+	echo "Running ${TEST_NAME}"
+
+	local -a opts=()
+
+	if _test_dev_is_zoned; then
+		blkzone reset "$TEST_DEV"
+		_test_dev_set_scheduler deadline
+		opts+=("--direct=1" "--zonemode=zbd")
+		opts+=("--max_open_zones=$(_test_dev_max_open_active_zones)")
+	fi
+
+	FIO_PERF_FIELDS=("write iops")
+	_fio_perf --bs=4k --rw=randwrite --norandommap --fsync=1 \
+		--number_ios=256 --numjobs=64 --name=flushes \
+		"${opts[@]}" --filename="$TEST_DEV"
+
+	echo "Test complete"
+}

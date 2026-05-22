@@ -1,0 +1,42 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2016-2018 Western Digital Corporation or its affiliates
+
+. tests/srp/rc
+
+DESCRIPTION="Create and remove LUNs"
+QUICK=1
+
+# Count the number of LUNs created by start_srpt() from the initiator side.
+count_luns() {
+	local h luns=0 p
+
+	for p in /sys/class/srp_remote_ports/*; do
+		[ -e "$p" ] || continue
+		h="${p##*/}"; h="${h#port-}"; h="${h%:1}";
+		for d in "/sys/class/scsi_device/${h}:"*; do
+			[ -e "$d" ] && ((luns++))
+		done
+		[ "$luns" -gt 0 ] && break
+	done
+	echo "$luns"
+}
+
+wait_for_luns() {
+	local i luns
+
+	use_blk_mq y y || return $?
+	for ((i=0;i<100;i++)); do
+		luns=$(count_luns)
+		[ "$luns" -ge ${#vdev_path[@]} ] && break
+		sleep .1
+	done
+	echo "count_luns(): $luns <> ${#vdev_path[@]}" >>"$FULL"
+	echo "count_luns(): $luns <> ${#vdev_path[@]}"
+	[ "$luns" -ge ${#vdev_path[@]} ]
+}
+
+test() {
+	trap 'trap "" EXIT; teardown' EXIT
+	setup && wait_for_luns && echo Passed
+}

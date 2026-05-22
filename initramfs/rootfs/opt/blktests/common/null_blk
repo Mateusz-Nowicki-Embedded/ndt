@@ -1,0 +1,84 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+#
+# null_blk helper functions.
+
+. common/shellcheck
+
+_have_null_blk() {
+	_have_driver null_blk
+}
+
+_have_null_blk_feature() {
+	# Ensure that null_blk driver is built-in or loaded
+	if ! [[ -d /sys/module/null_blk ]]; then
+		if ! modprobe -q null_blk; then
+			return 1
+		fi
+		if [[ ! "${MODULES_TO_UNLOAD[*]}" =~ null_blk ]]; then
+			MODULES_TO_UNLOAD+=(null_blk)
+		fi
+	fi
+
+	# Check that null_blk has the specified feature
+	grep -qe "$1" /sys/kernel/config/nullb/features
+}
+
+_remove_null_blk_devices() {
+	if [[ -d /sys/kernel/config/nullb ]]; then
+		find /sys/kernel/config/nullb -mindepth 1 -maxdepth 1 \
+		     -type d -delete
+	fi
+}
+
+_init_null_blk() {
+	_remove_null_blk_devices
+
+	local args=("$@")
+	if (( RUN_FOR_ZONED )); then args+=("zoned=1"); fi
+
+	_patient_rmmod null_blk || return 1
+	if ! modprobe null_blk "${args[@]}"; then
+		SKIP_REASONS+=("requires modular null_blk")
+		return 1
+	fi
+
+	udevadm settle
+	return 0
+}
+
+# Configure one null_blk instance with name $1 and parameters $2..${$#}.
+_configure_null_blk() {
+	local nullb_path=/sys/kernel/config/nullb/$1 params param
+	shift
+
+	if [[ ! -d /sys/module/null_blk ]]; then
+		modprobe -q null_blk
+	fi
+
+	mkdir "$nullb_path" || return $?
+
+	params=()
+	if (( RUN_FOR_ZONED )); then
+		params+=(zoned=1)
+	fi
+	params+=("$@")
+
+	[[ -n "${FULL}" ]] && echo "$nullb_path ${params[*]}" >>"${FULL}"
+
+	for param in "${params[@]}"; do
+		local key="${param%%=*}" val="${param#*=}"
+		if ! echo "$val" > "$nullb_path/$key"; then
+			echo "Writing $val into $nullb_path/$key failed"
+			return 1
+		fi
+	done
+	udevadm settle
+}
+
+_exit_null_blk() {
+	_remove_null_blk_devices
+	udevadm settle
+	_patient_rmmod null_blk
+}

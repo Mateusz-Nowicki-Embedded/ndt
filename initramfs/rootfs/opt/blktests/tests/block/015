@@ -1,0 +1,53 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2018 Omar Sandoval
+#
+# Test blk-mq requeues with all schedulers using null-blk. Regression test for
+# commit ba989a01469d ("block: kyber: fix domain token leak during requeue").
+
+. tests/block/rc
+. common/null_blk
+
+DESCRIPTION="run null-blk on different schedulers with requeue injection configured"
+QUICK=1
+
+requires() {
+	_have_null_blk && _have_module_param null_blk requeue
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	local faultb=faultb0
+
+	# Here, we requeue 10% of the time.
+	if ! _configure_null_blk "$faultb" requeue_inject/probability=10 \
+	     requeue_inject/times=-1 requeue_inject/verbose=0 power=1 \
+	     > /dev/null 2>&1; then
+		rmdir /sys/kernel/config/nullb/"$faultb"
+		if _module_file_exists null_blk; then
+			faultb=nullb0
+
+			# Fall back to set up with module parameter. The format
+			# is "<interval>,<probability>,<space>,<times>"
+			if ! _init_null_blk requeue='1,10,0,-1'; then
+				echo "Configuring null_blk failed"
+				return 1
+			fi
+		else
+			SKIP_REASONS+=("requires fault injection via configfs or modular null_blk")
+			return 1
+		fi
+	fi
+
+	for sched in $(_io_schedulers "$faultb"); do
+		echo "Testing $sched" >> "$FULL"
+		echo "$sched" > /sys/block/"$faultb"/queue/scheduler
+		dd if=/dev/"$faultb" of=/dev/null bs=4K count=$((512 * 1024)) \
+			iflag=direct status=none
+	done
+
+	_exit_null_blk
+
+	echo "Test complete"
+}

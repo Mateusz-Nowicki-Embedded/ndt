@@ -1,0 +1,18 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+#
+# Test recording arbitrary test metrics.
+
+. tests/meta/rc
+
+DESCRIPTION="record pid and random junk"
+
+test() {
+	echo "Running ${TEST_NAME}"
+	sleep 1
+	TEST_RUN["pid"]=$$
+	TEST_RUN["random"]="$(od -N $((4 * (RANDOM % 4))) -An -vtx1 /dev/urandom | tr -d ' \n')"
+	TEST_RUN[$$]=hello
+	echo "Test complete"
+}

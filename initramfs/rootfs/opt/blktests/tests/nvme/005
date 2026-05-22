@@ -1,0 +1,44 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2018 Johannes Thumshirn
+#
+# Regression test for patch "nvmet: switch loopback target state to connecting
+# when resetting"
+
+. tests/nvme/rc
+
+DESCRIPTION="reset local loopback target"
+QUICK=1
+
+requires() {
+	_nvme_requires
+	_have_loop
+	_have_module_param_value nvme_core multipath Y
+	_require_nvme_trtype_is_fabrics
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	_setup_nvmet
+
+	local nvmedev
+
+	_nvmet_target_setup
+
+	_nvme_connect_subsys
+
+	nvmedev=$(_find_nvme_dev "${def_subsysnqn}")
+
+	echo 1 > "/sys/class/nvme/${nvmedev}/reset_controller"
+
+	_nvme_disconnect_ctrl "${nvmedev}"
+
+	_nvmet_target_cleanup
+
+	echo "Test complete"
+}

@@ -1,0 +1,15 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+#
+# Test a test that fails with bad output which has a very long diff.
+
+. tests/meta/rc
+
+DESCRIPTION="produce lots of bad output"
+
+test() {
+	for ((i = 1; i <= 100; i++)); do
+		echo "$i" '¯\_(ツ)_/¯'
+	done
+}

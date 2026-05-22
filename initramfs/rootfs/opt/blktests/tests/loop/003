@@ -1,0 +1,27 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Omar Sandoval
+#
+# Regression test for commit 6460495709ae ("Fix loop device flush before
+# configure v3").
+
+. tests/loop/rc
+
+DESCRIPTION="time opening and closing an unbound loop device"
+QUICK=1
+
+requires() {
+	_have_src_program openclose
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	# In a subshell so TIMEFORMAT doesn't get clobbered.
+	(
+	TIMEFORMAT="Test took %0R seconds"
+	time src/openclose "$(losetup -f)" 5000
+	)
+
+	echo "Test complete"
+}

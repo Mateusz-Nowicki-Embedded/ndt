@@ -1,0 +1,62 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2019 Logan Gunthorpe
+#
+# Regression test for the following patches:
+#    nvme: fix controller removal race with scan work
+#    nvme: fix regression upon hot device removal and insertion
+#    nvme-core: Fix extra device_put() call on error path
+#    nvmet-loop: Flush nvme_delete_wq when removing the port
+#    nvmet: Fix use-after-free bug when a port is removed
+#
+# All these patches fix issues related to deleting a controller
+# immediately after setting it up.
+
+. tests/nvme/rc
+
+DESCRIPTION="test deletion of NVMeOF controllers immediately after setup"
+QUICK=1
+
+requires() {
+	_nvme_requires
+	_have_loop
+	_require_nvme_trtype_is_fabrics
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	_setup_nvmet
+
+	local subsys="blktests-subsystem-"
+	local iterations=10
+	local loop_dev
+	local port
+
+	truncate -s "${NVME_IMG_SIZE}" "$(_nvme_def_file_path)"
+
+	loop_dev="$(losetup -f --show "$(_nvme_def_file_path)")"
+
+	port="$(_create_nvmet_port)"
+
+	for ((i = 0; i < iterations; i++)); do
+		_nvmet_target_setup --subsysnqn "${subsys}$i" \
+			--blkdev "${loop_dev}"
+
+		_nvme_connect_subsys --subsysnqn "${subsys}$i"
+		_nvme_disconnect_subsys --subsysnqn "${subsys}$i" >> "${FULL}" 2>&1
+
+		_nvmet_target_cleanup --subsysnqn "${subsys}$i" \
+			--blkdev "${loop_dev}"
+	done
+
+	_remove_nvmet_port "${port}"
+	losetup -d "$loop_dev"
+	rm "$(_nvme_def_file_path)"
+
+	echo "Test complete"
+}

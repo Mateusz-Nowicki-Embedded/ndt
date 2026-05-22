@@ -1,0 +1,37 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2018 Josef Bacik
+#
+# Test nbd device resizing. Regression test for patches "nbd: update size when
+# connected" and "nbd: use bd_set_size when updating disk size".
+
+. tests/nbd/rc
+
+DESCRIPTION="resize a connected nbd device"
+QUICK=1
+
+requires() {
+	_have_nbd
+	_have_program parted
+	_have_src_program nbdsetsize
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+	_start_nbd_server
+	nbd-client -L -N export localhost /dev/nbd0 >> "$FULL" 2>&1
+	_wait_for_nbd_connect
+	udevadm settle
+
+	parted -s /dev/nbd0 print 2>> "$FULL" | grep 'Disk /dev/nbd0'
+	lsblk --raw --noheadings /dev/nbd0
+
+	echo "Setting size to 1gib"
+	src/nbdsetsize /dev/nbd0 1073741824
+
+	lsblk --raw --noheadings /dev/nbd0
+	parted -s /dev/nbd0 print 2>> "$FULL" | grep 'Disk /dev/nbd0'
+
+	nbd-client -d /dev/nbd0 >> "$FULL" 2>&1
+	_stop_nbd_server
+}

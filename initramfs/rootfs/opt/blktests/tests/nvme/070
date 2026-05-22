@@ -1,0 +1,222 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026 Mateusz Nowicki
+#
+# Reset the NVMe PCI controller while every MSI-X vector is masked
+# from underneath the driver.
+#
+# Flow:
+#   1) fio randrw runs in the background to keep the IO path busy
+#   2) host masks all MSI-X vectors directly in BAR0 via pcimem,
+#      bypassing the driver (sets PCI_MSIX_ENTRY_CTRL_MASKBIT)
+#   3) test triggers `echo 1 > .../reset_controller`
+#   4) verifies the controller comes back, a fresh admin command works,
+#      and the device is healthy from the driver's POV
+#
+# Why this works without an HMP command:
+#   QEMU's hw/pci/msix.c msix_notify() consults msix_is_masked() before
+#   firing msi_send_message().  The mask bit lives in dev->msix_table[]
+#   which is just the BAR0 region the kernel (and pcimem) can write.
+#   See hw/nvme/ctrl.c: msix_init(... &n->bar0, 0, msix_table_offset ...).
+#
+# MSI-X table offset in BAR0 for this harness:
+#   sizeof(NvmeBar) + 2 * (max_ioqpairs+1) * NVME_DB_SIZE  aligned to
+#   4 KiB = 0x1000 + 2 * 9 * 4 -> 0x2000 for max_ioqpairs=8.
+# Vector N's Vector Control reg lives at +16*N + 0xC.
+
+. tests/nvme/rc
+
+nvme_trtype=pci
+
+DESCRIPTION="reset controller while all MSI-X vectors are masked"
+QUICK=1
+
+requires() {
+	_nvme_requires
+	_have_fio
+	_have_program pcimem
+}
+
+device_requires() {
+	_require_test_dev_is_nvme_pci
+	_test_dev_has_no_metadata
+}
+
+# MSI-X table offset in BAR0 for our QEMU NVMe (max_ioqpairs=8,
+# msix_exclusive_bar=off).  Stable while we don't change those params.
+NDT_MSIX_TABLE_OFF=${NDT_MSIX_TABLE_OFF:-0x2000}
+NDT_INNER_ITER=${NDT_INNER_ITER:-1}
+NDT_FIO_RUNTIME=${NDT_FIO_RUNTIME:-40}
+NDT_FIO_SLEEP=${NDT_FIO_SLEEP:-20}
+# Race-repro knobs (default off — set to enable aggressive timing).
+#   NDT_IO_TIMEOUT_MS:        if set, /sys/block/<dev>/queue/io_timeout
+#                             (ms).  Short value (100 ms) forces frequent
+#                             nvme_timeout -> nvme_poll_irqdisable, which
+#                             is one side of the race.
+#   NDT_RESET_JITTER_MAX_MS:  per-iter random sleep (0..max) between
+#                             masking MSI-X and writing reset_controller,
+#                             breaking lockstep timing across iters.
+#   NDT_RESET_BURST_MAX:      per-iter random N (1..max) of reset writes
+#                             back-to-back, each separated by 1..50 ms.
+#                             Multiplies nvme_reset_work invocations.
+NDT_IO_TIMEOUT_MS=${NDT_IO_TIMEOUT_MS:-}
+NDT_RESET_JITTER_MAX_MS=${NDT_RESET_JITTER_MAX_MS:-0}
+NDT_RESET_BURST_MAX=${NDT_RESET_BURST_MAX:-1}
+
+_070_run_one() {
+	local sysfs=$1 nvmedev=$2 res0=$3 iter=$4
+	local m i r n_vec off fio_pid fio_rc
+	local seed jitter_ms burst sub dev_short
+
+	# Per-iter seed from kernel entropy.  Each iter gets a fresh value
+	# and we log it so a hit can be replayed with the same seed.
+	seed=$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')
+	echo "=== NDT_ITER_SEED iter=${iter} seed=${seed} ===" > /dev/ttyS0
+	RANDOM=$seed
+
+	jitter_ms=0
+	if (( NDT_RESET_JITTER_MAX_MS > 0 )); then
+		jitter_ms=$(( RANDOM % NDT_RESET_JITTER_MAX_MS ))
+	fi
+	burst=1
+	if (( NDT_RESET_BURST_MAX > 1 )); then
+		burst=$(( (RANDOM % NDT_RESET_BURST_MAX) + 1 ))
+	fi
+	echo "=== NDT_ITER_PARAMS iter=${iter} jitter_ms=${jitter_ms} burst=${burst} ===" \
+		> /dev/ttyS0
+
+	n_vec=$(grep -c "${nvmedev}q" /proc/interrupts || true)
+	if (( n_vec < 1 )); then
+		echo "no ${nvmedev} MSI-X vectors visible in /proc/interrupts"
+		return 1
+	fi
+
+	dev_short=${TEST_DEV##*/}
+	if [[ -n "$NDT_IO_TIMEOUT_MS" ]]; then
+		echo "$NDT_IO_TIMEOUT_MS" \
+			> "/sys/block/${dev_short}/queue/io_timeout" 2>/dev/null || true
+	fi
+
+	_run_fio_rand_io --filename="$TEST_DEV" --rw=randrw \
+		--time_based --runtime="$NDT_FIO_RUNTIME" \
+		--group_reporting &> /dev/null &
+	fio_pid=$!
+
+	sleep "$NDT_FIO_SLEEP"
+
+	# Helper: mask every MSI-X vector currently allocated to the controller.
+	# Re-evaluates the vector count each call because nvme_reset_work
+	# re-allocates the table from scratch — old masks are wiped, new
+	# vectors may not match the previous layout.
+	_mask_all() {
+		local n off i
+		n=$(grep -c "${nvmedev}q" /proc/interrupts || true)
+		for (( i = 0; i < n; i++ )); do
+			off=$(printf '0x%x' $(( NDT_MSIX_TABLE_OFF + 16 * i + 0xC )))
+			pcimem "$res0" "$off" w 0x1 > /dev/null 2>&1 || true
+		done
+	}
+
+	_mask_all
+
+	if (( jitter_ms > 0 )); then
+		sleep "$(printf '0.%03d' "$jitter_ms")"
+	fi
+
+	# Reset burst.  Re-mask after every reset — nvme_reset_work
+	# re-allocates MSI-X, so without re-masking the controller comes
+	# back with IRQs delivering normally and the timeout/poll path
+	# (which is one side of the race) goes idle between bursts.
+	for (( r = 0; r < burst; r++ )); do
+		echo 1 > "${sysfs}/${nvmedev}/reset_controller" 2>/dev/null || true
+
+		# Brief wait for device to be back before re-masking — without
+		# this the pcimem writes target a half-initialised MSI-X table.
+		for (( m = 0; m < 20; m++ )); do
+			[[ -b "$TEST_DEV" ]] && break
+			sleep 0.1
+		done
+
+		_mask_all
+
+		if (( r < burst - 1 )); then
+			sub=$(( (RANDOM % 50) + 1 ))
+			sleep "$(printf '0.%03d' "$sub")"
+		fi
+	done
+
+	wait "$fio_pid" 2>/dev/null
+	fio_rc=$?
+
+	for (( m = 0; m < 40; m++ )); do
+		[[ -b "$TEST_DEV" ]] && break
+		sleep 0.5
+	done
+	if (( m >= 40 )); then
+		echo "$TEST_DEV did not come back after reset"
+		return 1
+	fi
+	udevadm settle
+
+	if ! nvme id-ctrl "$TEST_DEV" > /dev/null 2>&1; then
+		echo "id-ctrl failed after reset (MSI-X path stuck?)"
+		return 1
+	fi
+
+	if (( fio_rc != 0 )); then
+		echo "fio rc=${fio_rc} (expected — IO dropped during masked window)" \
+			>> "${FULL}"
+	fi
+	return 0
+}
+
+test_device() {
+	echo "Running ${TEST_NAME}"
+
+	local pdev sysfs nvmedev res0 ix iter_st overall_rc=0
+	local _gate
+
+	pdev=$(_get_pci_dev_from_blkdev)
+	sysfs="/sys/bus/pci/devices/${pdev}/nvme"
+	if [[ ! -d "$sysfs" ]]; then
+		echo "$sysfs missing"
+		return 1
+	fi
+	nvmedev=$(ls "$sysfs" | head -1)
+	if [[ -z "$nvmedev" ]]; then
+		echo "no nvme controller under $sysfs"
+		return 1
+	fi
+	res0=/sys/bus/pci/devices/${pdev}/resource0
+	if [[ ! -e "$res0" ]]; then
+		echo "$res0 missing"
+		return 1
+	fi
+
+	for (( ix = 1; ix <= NDT_INNER_ITER; ix++ )); do
+		# Hand control back to host every iter > 1 so it can
+		# observe / re-arm whatever; any line on ttyS1 unblocks.
+		if (( NDT_INNER_ITER > 1 )); then
+			echo "=== NDT_INNER_ITER iter=$ix phase='ready' ===" \
+				> /dev/ttyS0
+			read -r -t 600 _gate < /dev/ttyS1 || true
+		fi
+
+		if _070_run_one "$sysfs" "$nvmedev" "$res0" "$ix"; then
+			iter_st=done
+		else
+			iter_st=fail
+			overall_rc=1
+		fi
+
+		if (( NDT_INNER_ITER > 1 )); then
+			echo "=== NDT_INNER_ITER iter=$ix phase='${iter_st}' ===" \
+				> /dev/ttyS0
+		fi
+	done
+
+	if (( overall_rc == 0 )); then
+		echo "Test complete"
+	fi
+	return "$overall_rc"
+}

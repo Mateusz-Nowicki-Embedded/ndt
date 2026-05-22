@@ -1,0 +1,69 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2022 Hannes Reinecke, SUSE Labs
+#
+# Test hash and dh group variations for authenticated connections
+
+. tests/nvme/rc
+
+DESCRIPTION="Test hash and DH group variations for authenticated connections"
+QUICK=1
+
+requires() {
+	_nvme_requires
+	_have_loop
+	_have_kernel_options NVME_AUTH NVME_TARGET_AUTH
+	_require_kernel_nvme_fabrics_feature dhchap_ctrl_secret
+	_require_nvme_trtype_is_fabrics
+	_require_nvme_cli_auth
+	_have_crypto_algorithm dh-generic
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	_setup_nvmet
+
+	local hash
+	local dhgroup
+	local hostkey
+	local ctrldev
+
+	hostkey="$(nvme gen-dhchap-key -n "${def_hostnqn}" 2> /dev/null)"
+	if [ -z "$hostkey" ] ; then
+		echo "nvme gen-dhchap-key failed"
+		return 1
+	fi
+
+	_nvmet_target_setup --blkdev file --hostkey "${hostkey}"
+
+	for hash in "hmac(sha256)" "hmac(sha384)" "hmac(sha512)" ; do
+
+		echo "Testing hash ${hash}"
+
+		_set_nvmet_hash "${def_hostnqn}" "${hash}"
+
+		_nvme_connect_subsys --dhchap-secret "${hostkey}"
+
+		_nvme_disconnect_subsys
+	done
+
+	for dhgroup in "ffdhe2048" "ffdhe3072" "ffdhe4096" "ffdhe6144" "ffdhe8192" ; do
+
+		echo "Testing DH group ${dhgroup}"
+
+		_set_nvmet_dhgroup "${def_hostnqn}" "${dhgroup}"
+
+		_nvme_connect_subsys --dhchap-secret "${hostkey}"
+
+		_nvme_disconnect_subsys
+	done
+
+	_nvmet_target_cleanup
+
+	echo "Test complete"
+}

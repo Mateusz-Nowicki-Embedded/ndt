@@ -1,0 +1,175 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026 Mateusz Nowicki
+#
+# Stress the NVMe PCI reset path with a burst of admin commands in
+# flight on top of random-rw I/O.
+#
+# Background fio (randrw) exercises the I/O path.  Mid-run the test
+# fires a small burst of `nvme id-ctrl` invocations in parallel
+# (default 8, override by editing NDT_ID_BURST below or setting it
+# in /opt/blktests/config inside the guest).  Each ioctl is synchronous
+# in the caller, but multiple processes stream multiple SQEs into the
+# admin SQ in parallel — admin tagset is a normal blk-mq queue with
+# depth NVME_AQ_BLK_MQ_DEPTH, so the controller mailbox holds them
+# all.  Immediately afterwards the test kicks reset_controller via
+#   /sys/bus/pci/devices/<bdf>/nvme/<nvmeN>/reset_controller
+# which is the PCI-rooted view of the same attribute /sys/class/nvme/
+# exposes; using the PCI path keeps the test specific to nvme-pci.
+#
+# To make the admin burst actually be "in flight" at reset time
+# (instead of racing to complete before the reset arrives), pair this
+# test with the forked QEMU's per-SQ completion delay on the admin
+# queue, e.g.:
+#
+#   ./ndt.sh 68 cq-delay=0:30000
+#
+# That holds admin CQEs for 30 s, so reset hits SQEs the controller
+# has not yet posted completions for, exercising the in-flight cancel
+# path (nvme_cancel_tagset on the admin tagset; each pending ioctl
+# returns -EIO).  Without cq-delay the burst still issues admin
+# commands but they generally complete before the reset; the test
+# then degrades to "reset under random-rw I/O" — still useful, just
+# less stressful.
+#
+# Inner iterations (same QEMU session)
+# ------------------------------------
+# If $NDT_INNER_ITER > 1, the test repeats the fio+burst+reset
+# scenario N times within a single ./check invocation (i.e. one QEMU
+# boot).  This is for checking whether one reset affects the next one
+# — e.g. queue accounting leak that only shows after the 3rd reset.
+#
+# Per-iter handshake on the NDT serial sockets (bypassing blktests'
+# stdout so the .out diff stays stable):
+#   guest -> /dev/ttyS0:  === NDT_INNER_ITER iter=N phase='ready' ===
+#   host  -> /dev/ttyS1:  GO    (after re-applying any cq-delay)
+#   guest -> /dev/ttyS0:  === NDT_INNER_ITER iter=N phase='done|fail' ===
+# Because cq-delay does NOT survive a controller reset, the host
+# re-applies it on every iteration's 'ready' before sending GO.
+#
+# Run with e.g.:
+#   ./ndt.sh 68 inner-iter=3 cq-delay=0:5000
+
+. tests/nvme/rc
+
+nvme_trtype=pci
+
+DESCRIPTION="reset controller during random RW I/O with admin cmds in flight"
+QUICK=1
+CAN_BE_ZONED=1
+
+NDT_ID_BURST=${NDT_ID_BURST:-8}
+NDT_INNER_ITER=${NDT_INNER_ITER:-1}
+
+requires() {
+	_nvme_requires
+	_have_fio
+}
+
+device_requires() {
+	_require_test_dev_is_nvme_pci
+	# fio does not understand extended-LBA / separate-buffer metadata
+	# layouts without per-IO metadata options; skip metadata namespaces
+	# instead of trying to special-case them.
+	_test_dev_has_no_metadata
+}
+
+# Run one round of: fio bg + admin burst + reset + wait for the
+# block device to come back.  Returns 0 on success, 1 on failure;
+# failure reasons are printed to stdout (so they end up in the
+# blktests .full log and trigger an .out diff).
+_068_run_one() {
+	local sysfs=$1 nvmedev=$2
+	local m i p fio_pid fio_rc
+	local -a id_pids=()
+
+	_run_fio_rand_io --filename="$TEST_DEV" --rw=randrw \
+		--time_based --runtime=30 \
+		--group_reporting &> /dev/null &
+	fio_pid=$!
+
+	sleep 20
+
+	for (( i = 0; i < NDT_ID_BURST; i++ )); do
+		nvme id-ctrl "$TEST_DEV" > /dev/null 2>&1 &
+		id_pids+=($!)
+	done
+
+	sleep 1
+
+	echo 1 > "${sysfs}/${nvmedev}/reset_controller"
+
+	for p in "${id_pids[@]}"; do
+		wait "$p" 2>/dev/null || true
+	done
+
+	wait "$fio_pid"
+	fio_rc=$?
+
+	for (( m = 0; m < 10; m++ )); do
+		[[ -b "$TEST_DEV" ]] && break
+		sleep 0.5
+	done
+	if (( m >= 10 )); then
+		echo "$TEST_DEV did not come back after reset"
+		return 1
+	fi
+	udevadm settle
+
+	if (( fio_rc != 0 )); then
+		echo "fio failed: rc=${fio_rc}"
+		return 1
+	fi
+	return 0
+}
+
+test_device() {
+	echo "Running ${TEST_NAME}"
+
+	local pdev sysfs nvmedev ix iter_st overall_rc=0
+	local _gate
+
+	pdev=$(_get_pci_dev_from_blkdev)
+	sysfs="/sys/bus/pci/devices/${pdev}/nvme"
+	if [[ ! -d "$sysfs" ]]; then
+		echo "$sysfs missing"
+		return 1
+	fi
+	# Exactly one controller per PCI function; pick whichever it is.
+	nvmedev=$(ls "$sysfs" | head -1)
+	if [[ -z "$nvmedev" ]]; then
+		echo "no nvme controller under $sysfs"
+		return 1
+	fi
+
+	for (( ix = 1; ix <= NDT_INNER_ITER; ix++ )); do
+		# Multi-iter mode: hand control back to the host so it can
+		# re-apply cq-delay on the freshly recreated admin SQ before
+		# we kick the next round.  Single-iter mode keeps the test
+		# behaviour bit-for-bit compatible with v1.
+		if (( NDT_INNER_ITER > 1 )); then
+			echo "=== NDT_INNER_ITER iter=$ix phase='ready' ===" \
+				> /dev/ttyS0
+			# 10-minute timeout so a host-side bug doesn't hang
+			# blktests forever; any line unblocks.
+			read -r -t 600 _gate < /dev/ttyS1 || true
+		fi
+
+		if _068_run_one "$sysfs" "$nvmedev"; then
+			iter_st=done
+		else
+			iter_st=fail
+			overall_rc=1
+		fi
+
+		if (( NDT_INNER_ITER > 1 )); then
+			echo "=== NDT_INNER_ITER iter=$ix phase='${iter_st}' ===" \
+				> /dev/ttyS0
+		fi
+	done
+
+	if (( overall_rc == 0 )); then
+		echo "Test complete"
+	fi
+	return "$overall_rc"
+}

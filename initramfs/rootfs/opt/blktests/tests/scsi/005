@@ -1,0 +1,48 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2017 Hannes Reinecke, SUSE Linux GmbH
+#
+# Regression test for patch "scsi_devinfo: fixup string compare".
+
+. tests/scsi/rc
+. common/scsi_debug
+
+DESCRIPTION="test SCSI device blacklisting"
+QUICK=1
+
+requires() {
+	_have_scsi_debug
+	_have_module_param scsi_debug inq_vendor
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	local inqs=(
+		"                        "
+		"AAAAAAAABBBBBBBBBBBBBBBB"
+		"HITACHI OPEN-V          "
+		"        Scanner         "
+		"Inateck                 "
+		"Promise STEX            "
+		"HITA    OPEN-V          "
+		"ABCD    Scanner         "
+	)
+
+	local inq vendor model blacklist
+	for inq in "${inqs[@]}"; do
+		vendor="${inq:0:8}"
+		model="${inq:8:16}"
+		if ! _configure_scsi_debug inq_vendor="$vendor" inq_product="$model"; then
+			continue
+		fi
+		vendor="$(cat "/sys/block/${SCSI_DEBUG_DEVICES[0]}/device/vendor")"
+		model="$(cat "/sys/block/${SCSI_DEBUG_DEVICES[0]}/device/model")"
+		blacklist="$(cat "/sys/block/${SCSI_DEBUG_DEVICES[0]}/device/blacklist")"
+		echo "$vendor $model $blacklist"
+		_exit_scsi_debug
+	done
+
+	echo "Test complete"
+	return 0
+}

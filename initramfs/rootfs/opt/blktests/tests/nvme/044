@@ -1,0 +1,88 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2022 Hannes Reinecke, SUSE Labs
+#
+# Test bi-directional authentication
+
+. tests/nvme/rc
+
+DESCRIPTION="Test bi-directional authentication"
+QUICK=1
+
+requires() {
+	_nvme_requires
+	_have_loop
+	_have_kernel_options NVME_AUTH NVME_TARGET_AUTH
+	_require_kernel_nvme_fabrics_feature dhchap_ctrl_secret
+	_require_nvme_trtype_is_fabrics
+	_require_nvme_cli_auth
+	_have_crypto_algorithm dh-generic
+}
+
+set_conditions() {
+	_set_nvme_trtype "$@"
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	_setup_nvmet
+
+	local hostkey
+	local ctrlkey
+	local ctrldev
+
+	hostkey="$(nvme gen-dhchap-key -n "${def_subsysnqn}" 2> /dev/null)"
+	if [ -z "$hostkey" ] ; then
+		echo "failed to generate host key"
+		return 1
+	fi
+
+	ctrlkey="$(nvme gen-dhchap-key -n "${def_subsysnqn}" 2> /dev/null)"
+	if [ -z "$ctrlkey" ] ; then
+		echo "failed to generate ctrl key"
+		return 1
+	fi
+
+	_nvmet_target_setup --blkdev file --ctrlkey "${ctrlkey}" \
+			    --hostkey "${hostkey}"
+
+	_set_nvmet_dhgroup "${def_hostnqn}" "ffdhe2048"
+
+	# Step 1: Connect with host authentication only
+	echo "Test host authentication"
+	_nvme_connect_subsys --dhchap-secret "${hostkey}"
+
+	_nvme_disconnect_subsys
+
+	# Step 2: Connect with host authentication
+	# and invalid ctrl authentication
+	echo "Test invalid ctrl authentication (should fail)"
+	_nvme_connect_subsys --dhchap-secret "${hostkey}" \
+			     --dhchap-ctrl-secret "${hostkey}" \
+			     --no-wait --expect-failure
+
+	_nvme_disconnect_subsys
+
+	# Step 3: Connect with host authentication
+	# and valid ctrl authentication
+	echo "Test valid ctrl authentication"
+	_nvme_connect_subsys --dhchap-secret "${hostkey}" \
+			     --dhchap-ctrl-secret "${ctrlkey}"
+
+	_nvme_disconnect_subsys
+
+	# Step 4: Connect with host authentication
+	# and invalid ctrl key
+	echo "Test invalid ctrl key (should fail)"
+	invkey="DHHC-1:00:Jc/My1o0qtLCWRp+sHhAVafdfaS7YQOMYhk9zSmlatobqB8C:"
+	_nvme_connect_subsys --dhchap-secret "${hostkey}" \
+			     --dhchap-ctrl-secret "${invkey}" \
+			     --no-wait --expect-failure
+
+	_nvme_disconnect_subsys
+
+	_nvmet_target_cleanup
+
+	echo "Test complete"
+}

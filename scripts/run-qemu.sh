@@ -3,15 +3,23 @@
 # device — the test target is `nvmet-pci-sw`, which lives entirely inside
 # the guest kernel.  null_blk backs the controller's namespaces.
 #
-# Two host-side sockets (server, nowait):
-#   /tmp/qemu-serial.sock   ttyS0 console (kernel + init log, NDT sentinels)
-#   /tmp/qemu-ctrl.sock     ttyS1 control channel (host -> guest "GO" gate)
+# Serial routing — two modes:
+#   default        ttyS0 -> unix socket /tmp/qemu-serial.sock (server,nowait).
+#                  ndt.sh attaches via socat to capture the console + grep
+#                  for the NDT_RESULT sentinel.
+#   NDT_INTERACTIVE=1
+#                  ttyS0 -> stdio (mon:stdio: serial + QEMU monitor on the
+#                  same fd; Ctrl-A x exits, Ctrl-A c flips to monitor).
+#                  Used when the user just wants a shell in the guest.
 #
-# No HMP monitor — there's nothing to control on the QEMU side any more.
-# Anything the old QEMU HMP knobs did (nvme_completion_delay, hotplug)
-# is now exposed by the module itself via /sys/kernel/debug/nvmet-pci-sw/.
+# No HMP monitor and no ttyS1 control channel — the guest is driven entirely
+# via kernel cmdline (ndt.test=NNN ndt.iter=K) and reports back via the
+# NDT_RESULT sentinel on ttyS0 before poweroff -f.  Anything the old QEMU
+# HMP knobs did (nvme_completion_delay, hotplug) is now exposed by the
+# module itself via /sys/kernel/debug/nvmet-pci-sw/.
 #
 # Override defaults via env:
+#   NDT_INTERACTIVE=1                   # serial on stdio (see above)
 #   QEMU_EXTRA="-s -S" ./run-qemu.sh    # gdbstub + stop-at-start
 #   QEMU_BIN=...    ./run-qemu.sh       # alternate qemu binary
 #   BZIMAGE / INITRAMFS / APPEND        # override artifacts
@@ -45,6 +53,12 @@ for f in "$BZIMAGE" "$INITRAMFS"; do
     fi
 done
 
+if [[ "${NDT_INTERACTIVE:-0}" == "1" ]]; then
+    SERIAL_ARGS=( -serial mon:stdio )
+else
+    SERIAL_ARGS=( -serial unix:/tmp/qemu-serial.sock,server,nowait )
+fi
+
 # Q35 keeps the PCIe root complex (the module's virtual bridge lives
 # under bus 0xfe inside the guest — no QEMU PCIe device is plugged here).
 exec "$QEMU_BIN" \
@@ -55,8 +69,7 @@ exec "$QEMU_BIN" \
     -nographic \
     -m 8G \
     -smp 16 \
-    -serial unix:/tmp/qemu-serial.sock,server,nowait \
-    -serial unix:/tmp/qemu-ctrl.sock,server,nowait \
+    "${SERIAL_ARGS[@]}" \
     -display none \
     -no-reboot \
     -cpu host -enable-kvm \

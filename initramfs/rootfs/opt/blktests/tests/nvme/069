@@ -1,0 +1,19 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026 Mateusz Nowicki
+#
+# Intentional always-fail probe.  Prints an extra line that is missing
+# from 069.out, so blktests' output diff trips and writes status=fail
+# in results/.../nvme/069.  Used to validate NDT's fail detection,
+# log collection and FAIL preview paths.  Does not touch any device.
+
+. tests/nvme/rc
+
+DESCRIPTION="intentional always-fail probe for harness"
+QUICK=1
+
+test() {
+	echo "Running ${TEST_NAME}"
+	echo "FORCED FAIL (this line is not in 069.out by design)"
+	echo "Test complete"
+}

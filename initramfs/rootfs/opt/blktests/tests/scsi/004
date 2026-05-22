@@ -1,0 +1,49 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright IBM Corp. 2018
+#
+# Ensure repeated SAM_STAT_TASK_SET_FULL results in EIO on timing out command.
+#
+# Regression test for commit cbe095e2b584 ("Revert "scsi: core: return
+# BLK_STS_OK for DID_OK in __scsi_error_from_host_byte()"")
+#
+# Found independently of corresponding commit mail threads while
+# experimenting with storage mirroring. This test is a storage-independent
+# reproducer for the error case I ran into.
+
+. tests/scsi/rc
+. common/scsi_debug
+
+DESCRIPTION="ensure repeated TASK SET FULL results in EIO on timing out command"
+CAN_BE_ZONED=1
+
+requires() {
+	_have_scsi_debug
+}
+
+test() {
+	echo "Running ${TEST_NAME}"
+
+	if ! _configure_scsi_debug max_luns=1 statistics=1 every_nth=1; then
+	    return 1
+	fi
+	echo 5 > "/sys/block/${SCSI_DEBUG_DEVICES[0]}/device/timeout"
+	# every_nth RW with full queue gets SAM_STAT_TASK_SET_FULL
+	echo 0x800 > /sys/bus/pseudo/drivers/scsi_debug/opts
+	# delay to reduce response repetition (1 second - 1 nanosecond, the
+	# maximum which scsi-debug allows)
+	echo 999999999 > /sys/bus/pseudo/drivers/scsi_debug/ndelay
+	# a single command fills device queue to satisfy 0x800 opts condition
+	echo 1 > "/sys/block/${SCSI_DEBUG_DEVICES[0]}/device/queue_depth"
+	dd if="/dev/${SCSI_DEBUG_DEVICES[0]}" iflag=direct of=/dev/null bs=512 count=1 |& grep -o "Input/output error"
+	# stop injection
+	echo 0 > /sys/bus/pseudo/drivers/scsi_debug/opts
+	# dd closing SCSI disk causes implicit TUR also being delayed once
+	# Remove the SCSI host to ensure all the pending I/O has finished.
+	host_cnt=$(cat /sys/bus/pseudo/drivers/scsi_debug/add_host)
+	echo -"$host_cnt" > /sys/bus/pseudo/drivers/scsi_debug/add_host
+	echo 1 > /sys/bus/pseudo/drivers/scsi_debug/ndelay
+	_exit_scsi_debug
+
+	echo "Test complete"
+}
