@@ -4,7 +4,6 @@
 #
 # Env overrides:
 #   JOBS=8                 override -j (default: nproc)
-#   EXTRA_CONFIGURE=...    extra args passed to QEMU's ./configure
 #   RECONFIGURE=1          force a re-run of ./configure before make
 
 set -euo pipefail
@@ -35,8 +34,7 @@ if [[ ! -f "$BUILD/build.ninja" || "${RECONFIGURE:-0}" == "1" ]]; then
             --target-list=x86_64-softmmu \
             --enable-kvm \
             --disable-docs \
-            --disable-werror \
-            ${EXTRA_CONFIGURE:-}
+            --disable-werror
     )
 fi
 

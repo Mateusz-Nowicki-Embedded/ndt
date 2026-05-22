@@ -6,7 +6,6 @@
 #
 # Env overrides:
 #   JOBS=8         override -j (default: nproc)
-#   CC=<path>      override C compiler (default: scripts/gcc-c17)
 
 set -euo pipefail
 
@@ -15,7 +14,7 @@ NDT=$(cd "$HERE/.." && pwd)
 SRC=$NDT/third_party/blktests-fork
 BUILD=$NDT/build/blktests
 JOBS=${JOBS:-$(nproc)}
-CC=${CC:-$HERE/gcc-c17}
+CC=$HERE/gcc-c17
 
 if [[ ! -x "$SRC/check" ]]; then
     echo "[build-blktests] error: $SRC/check not found" >&2

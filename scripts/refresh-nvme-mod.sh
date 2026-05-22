@@ -13,25 +13,24 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 NDT=$(cd "$HERE/.." && pwd)
 
-BUILD_DIR=${BUILD_DIR:-$NDT/build/linux}
-KSRC=${KSRC:-$NDT/third_party/linux-fork}
-ROOTFS=${ROOTFS:-$NDT/initramfs/rootfs}
-INITRAMFS=${INITRAMFS:-$NDT/initramfs/initramfs.cpio.gz}
+BUILD=$NDT/build/linux
+ROOTFS=$NDT/initramfs/rootfs
+INITRAMFS=$NDT/initramfs/initramfs.cpio.gz
 JOBS=${JOBS:-$(nproc)}
 
-KVER=$(make -s -C "$BUILD_DIR" kernelrelease)
-NVME_HOST="$BUILD_DIR/drivers/nvme/host"
+KVER=$(make -s -C "$BUILD" kernelrelease)
+NVME_HOST="$BUILD/drivers/nvme/host"
 MOD_DST="$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/host"
 
 echo "[refresh] kernel: $KVER"
-echo "[refresh] build:  $BUILD_DIR"
+echo "[refresh] build:  $BUILD"
 echo "[refresh] rootfs: $ROOTFS"
 
 if [[ "${NO_BUILD:-0}" != "1" ]]; then
     echo "[refresh] building modules (-j$JOBS)..."
     # In-tree narrow build: ask for the nvme/host directory targets directly.
     # 'M=' is reserved for *external* modules with their own Makefile, so don't use it here.
-    make -C "$BUILD_DIR" -j"$JOBS" drivers/nvme/host/ >/dev/null
+    make -C "$BUILD" -j"$JOBS" drivers/nvme/host/ >/dev/null
 fi
 
 echo "[refresh] staging .ko"
@@ -40,7 +39,7 @@ cp "$NVME_HOST/nvme-core.ko" "$NVME_HOST/nvme.ko" "$MOD_DST/"
 
 # These come from the kernel build and are needed for clean depmod runs.
 for f in modules.order modules.builtin modules.builtin.modinfo; do
-    [[ -f "$BUILD_DIR/$f" ]] && cp "$BUILD_DIR/$f" "$ROOTFS/lib/modules/$KVER/"
+    [[ -f "$BUILD/$f" ]] && cp "$BUILD/$f" "$ROOTFS/lib/modules/$KVER/"
 done
 
 echo "[refresh] depmod"

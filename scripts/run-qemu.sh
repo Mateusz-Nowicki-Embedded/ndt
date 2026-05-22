@@ -21,23 +21,21 @@
 # Override defaults via env:
 #   NDT_INTERACTIVE=1                   # serial on stdio (see above)
 #   QEMU_EXTRA="-s -S" ./run-qemu.sh    # gdbstub + stop-at-start
-#   QEMU_BIN=...    ./run-qemu.sh       # alternate qemu binary
-#   BZIMAGE / INITRAMFS / APPEND        # override artifacts
+#   APPEND="..."     ./run-qemu.sh      # override kernel cmdline
 
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 NDT=$(cd "$HERE/.." && pwd)
 
-LOCAL_QEMU="$NDT/build/qemu-host/qemu-system-x86_64"
-QEMU_BIN=${QEMU_BIN:-${LOCAL_QEMU}}
+QEMU_BIN="$NDT/build/qemu-host/qemu-system-x86_64"
 if [[ ! -x "$QEMU_BIN" ]]; then
     echo "[run-qemu.sh] $QEMU_BIN not found, falling back to system qemu-system-x86_64" >&2
     QEMU_BIN=qemu-system-x86_64
 fi
 
-BZIMAGE=${BZIMAGE:-"$NDT/build/linux/arch/x86/boot/bzImage"}
-INITRAMFS=${INITRAMFS:-"$NDT/initramfs/initramfs.cpio.gz"}
+BZIMAGE="$NDT/build/linux/arch/x86/boot/bzImage"
+INITRAMFS="$NDT/initramfs/initramfs.cpio.gz"
 # memmap=64K$0x100000000 — carve 64 KiB out of System RAM at the start of
 # the high-RAM e820 block (0x100000000-0x27fffffff on -m 8G).  Reserved
 # range backs BAR0 for the nvmet-pci-sw module (see modules/nvmet-pci-sw/
