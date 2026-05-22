@@ -1,10 +1,6 @@
 #!/bin/bash
 # Build QEMU from third_party/qemu-nvme into build/qemu-host/.
 # Output binary: build/qemu-host/qemu-system-x86_64
-#
-# Env overrides:
-#   JOBS=8                 override -j (default: nproc)
-#   RECONFIGURE=1          force a re-run of ./configure before make
 
 set -euo pipefail
 
@@ -12,7 +8,6 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 NDT=$(cd "$HERE/.." && pwd)
 QSRC=$NDT/third_party/qemu-nvme
 BUILD=$NDT/build/qemu-host
-JOBS=${JOBS:-$(nproc)}
 
 if [[ ! -f "$QSRC/configure" ]]; then
     echo "[build-qemu] error: $QSRC/configure not found" >&2
@@ -22,11 +17,10 @@ fi
 
 echo "[build-qemu] source: ${QSRC#$NDT/}"
 echo "[build-qemu] output: ${BUILD#$NDT/}"
-echo "[build-qemu] jobs:   $JOBS"
 
 mkdir -p "$BUILD"
 
-if [[ ! -f "$BUILD/build.ninja" || "${RECONFIGURE:-0}" == "1" ]]; then
+if [[ ! -f "$BUILD/build.ninja" ]]; then
     echo "[build-qemu] configuring..."
     (
         cd "$BUILD"
@@ -39,6 +33,6 @@ if [[ ! -f "$BUILD/build.ninja" || "${RECONFIGURE:-0}" == "1" ]]; then
 fi
 
 echo "[build-qemu] building..."
-make -C "$BUILD" -j"$JOBS"
+make -C "$BUILD" -j"$(nproc)"
 
 echo "[build-qemu] done: $BUILD/qemu-system-x86_64"

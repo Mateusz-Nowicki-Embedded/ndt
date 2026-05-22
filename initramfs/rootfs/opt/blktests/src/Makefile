@@ -8,6 +8,10 @@ HAVE_C_MACRO = $(shell if echo "$(H)include <$(1)>" |	\
 		$(CC) $(CFLAGS) -E - 2>&1 /dev/null | grep $(2) > /dev/null 2>&1; \
 		then echo 1;else echo 0; fi)
 
+# Out-of-tree build: with O=<dir>, write binaries under <dir>/ instead of
+# next to the sources.  Without O, behavior is unchanged.
+BIN := $(if $(O),$(O)/,)
+
 C_TARGETS := \
 	dio-offsets \
 	loblksize \
@@ -57,25 +61,29 @@ URING_FLAGS :=  -D_GNU_SOURCE
 URING_LIBS := -lpthread -luring
 LDFLAGS ?=
 
-all: $(TARGETS)
+all: $(addprefix $(BIN),$(TARGETS))
 
 clean:
-	rm -f $(TARGETS)
+	rm -f $(addprefix $(BIN),$(TARGETS))
 
-install: $(TARGETS)
+install: $(addprefix $(BIN),$(TARGETS))
 	install -m755 -d $(dest)
-	install $(TARGETS) $(dest)
+	install $(addprefix $(BIN),$(TARGETS)) $(dest)
 
-$(C_TARGETS): %: %.c
+$(addprefix $(BIN),$(C_TARGETS)): $(BIN)%: %.c
+	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
-$(CXX_TARGETS): %: %.cpp
+$(addprefix $(BIN),$(CXX_TARGETS)): $(BIN)%: %.cpp
+	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
 
-$(SYZKALLER_TARGETS): %: %.c
+$(addprefix $(BIN),$(SYZKALLER_TARGETS)): $(BIN)%: %.c
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -Wno-unused-but-set-variable $(LDFLAGS) -o $@ $^
 
-$(C_URING_TARGETS): %: %.c
+$(addprefix $(BIN),$(C_URING_TARGETS)): $(BIN)%: %.c
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(URING_FLAGS) -o $@ $^ $(URING_LIBS)
 
 .PHONY: all clean install

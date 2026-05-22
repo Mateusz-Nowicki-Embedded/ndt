@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stage build/ artifacts into initramfs/rootfs and repack the cpio.gz.
+# Copy build/ artifacts into initramfs/rootfs and repack the cpio.gz.
 #
 # Pulls in:
 #   build/linux/drivers/nvme/host/{nvme-core,nvme}.ko  -> /lib/modules/$KVER/
@@ -15,12 +15,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 NDT=$(cd "$HERE/.." && pwd)
 KBUILD=$NDT/build/linux
 NVMECLI=$NDT/build/nvme-cli
-BLKTESTS=$NDT/build/blktests
+BLKTESTS_SRC=$NDT/third_party/blktests-fork
+BLKTESTS_BIN=$NDT/build/blktests
 PCIMEM=$NDT/build/pcimem
 ROOTFS=$NDT/initramfs/rootfs
 CPIO=$NDT/initramfs/initramfs.cpio.gz
 
-for d in "$KBUILD" "$NVMECLI" "$BLKTESTS" "$PCIMEM"; do
+for d in "$KBUILD" "$NVMECLI" "$BLKTESTS_SRC" "$BLKTESTS_BIN" "$PCIMEM"; do
     if [[ ! -d "$d" ]]; then
         echo "[build-initramfs] missing: $d" >&2
         echo "[build-initramfs] hint: run ./build-all.sh first" >&2
@@ -38,22 +39,22 @@ echo "[build-initramfs] rootfs: ${ROOTFS#$NDT/}"
 echo "[build-initramfs] kver:   $KVER"
 
 # 1. Kernel modules (drop stale tree first)
-echo "[build-initramfs] stage kernel modules"
+echo "[build-initramfs] copy kernel modules"
 rm -rf "$ROOTFS/lib/modules"
 mkdir -p "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/host"
 cp "$KBUILD/drivers/nvme/host/nvme-core.ko" \
-   "$KBUILD/drivers/nvme/host/nvme.ko" \
-   "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/host/"
+    "$KBUILD/drivers/nvme/host/nvme.ko" \
+    "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/host/"
 
-# nvmet target stack (only stage what's actually built).
+# nvmet target stack (only copy what's actually built).
 NVMET_KO=$KBUILD/drivers/nvme/target/nvmet.ko
 if [[ -f "$NVMET_KO" ]]; then
     mkdir -p "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/target"
     cp "$NVMET_KO" "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/target/"
     for opt in nvme-loop.ko nvmet-tcp.ko nvmet-rdma.ko nvmet-fc.ko; do
-        [[ -f "$KBUILD/drivers/nvme/target/$opt" ]] && \
+        [[ -f "$KBUILD/drivers/nvme/target/$opt" ]] &&
             cp "$KBUILD/drivers/nvme/target/$opt" \
-               "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/target/"
+                "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/target/"
     done
 fi
 
@@ -80,19 +81,15 @@ NPS_KO=$NDT/third_party/nvmet-pci-sw/nvmet-pci-sw.ko
 if [[ -f "$NPS_KO" ]]; then
     mkdir -p "$ROOTFS/lib/modules/$KVER/extra"
     cp "$NPS_KO" "$ROOTFS/lib/modules/$KVER/extra/"
-    echo "[build-initramfs] stage out-of-tree: nvmet-pci-sw.ko"
+    echo "[build-initramfs] copy out-of-tree: nvmet-pci-sw.ko"
 else
     echo "[build-initramfs] warn: $NPS_KO not built, skipping" >&2
 fi
 
 depmod -b "$ROOTFS" "$KVER"
 
-# blktests' _have_kernel_options runs zgrep on /proc/config.gz (exposed by
-# CONFIG_IKCONFIG_PROC) — ship the wrapper so it can do that.
-install -D -m 755 /usr/bin/zgrep "$ROOTFS/usr/bin/zgrep"
-
 # 2. nvme-cli binary + libnvme
-echo "[build-initramfs] stage nvme-cli"
+echo "[build-initramfs] copy nvme-cli"
 install -D -m 755 "$NVMECLI/nvme" "$ROOTFS/usr/local/bin/nvme"
 mkdir -p "$ROOTFS/usr/lib64"
 rm -f "$ROOTFS/usr/lib64/libnvme.so"*
@@ -100,26 +97,25 @@ install -m 755 "$NVMECLI/libnvme/src/libnvme.so.3.0.0" "$ROOTFS/usr/lib64/"
 ln -s libnvme.so.3.0.0 "$ROOTFS/usr/lib64/libnvme.so.3"
 
 # 2b. pcimem — direct mmap-based BAR poke (MSI-X mask manipulation etc.)
-echo "[build-initramfs] stage pcimem"
+echo "[build-initramfs] copy pcimem"
 install -D -m 755 "$PCIMEM/pcimem" "$ROOTFS/usr/local/bin/pcimem"
 
-# 3. blktests source + helpers
-echo "[build-initramfs] stage blktests"
+# 3. blktests: source tree from third_party + out-of-tree binaries on top
+echo "[build-initramfs] copy blktests"
 rm -rf "$ROOTFS/opt/blktests"
 mkdir -p "$ROOTFS/opt"
-rsync -a --exclude='.git*' "$BLKTESTS/" "$ROOTFS/opt/blktests/"
-cat > "$ROOTFS/opt/blktests/config" <<'EOF'
-# nvmet-pci-sw exposes a single namespace backed by /dev/nullb0.
+rsync -a --exclude='.git*' --exclude='.github' "$BLKTESTS_SRC/" "$ROOTFS/opt/blktests/"
+rsync -a "$BLKTESTS_BIN/" "$ROOTFS/opt/blktests/src/"
+cat >"$ROOTFS/opt/blktests/config" <<'EOF'
 TEST_DEVS=(/dev/nvme0n1)
-# Unprivileged user used by tests like nvme/046; see initramfs/rootfs/etc/passwd.
 NORMAL_USER=nobody
 EOF
 
 # 4. Repack
 echo "[build-initramfs] pack cpio.gz"
-( cd "$ROOTFS" && \
-  find . -print0 | cpio --null --create --format=newc 2>/dev/null | \
-  gzip -9 > "$CPIO" )
+(cd "$ROOTFS" &&
+    find . -print0 | cpio --null --create --format=newc 2>/dev/null |
+    gzip -9 >"$CPIO")
 
 sz=$(du -h "$CPIO" | cut -f1)
 echo "[build-initramfs] done: ${CPIO#$NDT/} ($sz)"

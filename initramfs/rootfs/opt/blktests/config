@@ -1,4 +1,2 @@
-# nvmet-pci-sw exposes a single namespace backed by /dev/nullb0.
 TEST_DEVS=(/dev/nvme0n1)
-# Unprivileged user used by tests like nvme/046; see initramfs/rootfs/etc/passwd.
 NORMAL_USER=nobody

@@ -1,9 +1,0 @@
-fs/configfs/configfs.o
-drivers/pci/pcie/aer_inject.o
-drivers/block/null_blk/null_blk.o
-drivers/nvme/host/nvme-core.o
-drivers/nvme/host/nvme.o
-drivers/nvme/host/nvme-fabrics.o
-drivers/nvme/target/nvmet.o
-drivers/nvme/target/nvme-loop.o
-drivers/thermal/intel/x86_pkg_temp_thermal.o

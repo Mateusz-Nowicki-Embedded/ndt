@@ -2,7 +2,7 @@
 # Build the nvmet-pci-sw out-of-tree module against build/linux.
 #
 # Output: third_party/nvmet-pci-sw/nvmet-pci-sw.ko
-# build-initramfs.sh picks it up and stages into rootfs/lib/modules/<KVER>/extra/.
+# build-initramfs.sh picks it up and copies into rootfs/lib/modules/<KVER>/extra/.
 
 set -euo pipefail
 

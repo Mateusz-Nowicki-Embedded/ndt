@@ -1,7 +1,0 @@
-kernel/drivers/nvme/host/nvme.ko: kernel/drivers/nvme/host/nvme-core.ko
-kernel/drivers/nvme/host/nvme-core.ko:
-kernel/drivers/nvme/target/nvmet.ko: kernel/fs/configfs/configfs.ko kernel/drivers/nvme/host/nvme-core.ko
-kernel/drivers/nvme/target/nvme-loop.ko: kernel/drivers/nvme/target/nvmet.ko kernel/fs/configfs/configfs.ko kernel/drivers/nvme/host/nvme-core.ko
-kernel/drivers/block/null_blk.ko: kernel/fs/configfs/configfs.ko
-extra/nvmet-pci-sw.ko: kernel/drivers/nvme/target/nvmet.ko kernel/fs/configfs/configfs.ko kernel/drivers/nvme/host/nvme-core.ko
-kernel/fs/configfs/configfs.ko:
