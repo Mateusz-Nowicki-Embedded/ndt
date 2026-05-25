@@ -33,6 +33,36 @@ echo
 echo "=== nvme QEMU rootfs ==="
 echo "kernel: $(uname -r)"
 
+# KUnit mode (ndt.kunit=1): insmod the bundled nps-*-test.ko modules, sum the
+# KTAP they print into the NDT_RESULT sentinel and power off. The tests are
+# self-contained (no nvme device / nvmet target needed), so this short-circuits
+# before the device bring-up below.
+for tok in $(cat /proc/cmdline); do
+    [[ "$tok" == ndt.kunit=1 ]] || continue
+    echo "[init] kunit mode"
+    n=0
+    for m in "/lib/modules/$(uname -r)/extra"/nps-*-test.ko; do
+        [[ -e "$m" ]] || continue
+        insmod "$m" 2>&1 || echo "[init] insmod ${m##*/} failed"
+        n=$((n + 1))
+    done
+    if [[ "$n" -eq 0 ]]; then
+        echo "=== NDT_RESULT error='no-kunit-modules' ==="
+        poweroff -f
+    fi
+    dmesg | awk '
+        /# nps_[a-z_]+: pass:[0-9]+ fail:[0-9]+ skip:[0-9]+/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^pass:/) { split($i, a, ":"); p += a[2] }
+                if ($i ~ /^fail:/) { split($i, a, ":"); f += a[2] }
+                if ($i ~ /^skip:/) { split($i, a, ":"); s += a[2] }
+            }
+        }
+        END { printf "=== NDT_RESULT pass=%d fail=%d skip=%d iter=1 test=kunit ===\n", \
+                     p, f, s }'
+    poweroff -f
+done
+
 mkdir -p /run/udev
 /usr/lib/systemd/systemd-udevd --daemon
 udevadm trigger --action=add --type=subsystems

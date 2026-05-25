@@ -13,6 +13,7 @@ kernel/block/bsg.ko
 kernel/block/mq-deadline.ko
 kernel/block/kyber-iosched.ko
 kernel/block/bfq.ko
+kernel/lib/kunit/kunit.ko
 kernel/lib/math/rational.ko
 kernel/lib/crc/crc16.ko
 kernel/lib/crc/crc32.ko

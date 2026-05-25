@@ -41,7 +41,7 @@ INITRAMFS="$NDT/initramfs/initramfs.cpio.gz"
 # range backs BAR0 for the nvmet-pci-sw module (see modules/nvmet-pci-sw/
 # bar.c: bar_phys default 0x100000000).  Literal '$' escaped so the shell
 # doesn't expand $0.  nvme.poll_queues=4 enables io_uring --hipri path.
-APPEND=${APPEND:-"console=ttyS0 panic=-1 memmap=64K\$0x100000000 nvme.poll_queues=4"}
+APPEND=${APPEND:-"console=ttyS0 panic=-1 memmap=64K\$0x100000000 nvme.poll_queues=4 nvme_core.multipath=0"}
 
 for f in "$BZIMAGE" "$INITRAMFS"; do
     if [[ ! -f "$f" ]]; then

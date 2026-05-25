@@ -1,0 +1,13 @@
+#!/bin/sh
+# Minimal sudo shim for the root-only NDT initramfs. There is no privilege
+# separation here (PID 1 and the tests both run as root), so just strip the
+# sudo-specific options and exec the remaining command.
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-u|-g|-U|-p|-C|-r|-t|-T|-h) shift 2 ;;	# option + argument
+		--) shift; break ;;
+		-*) shift ;;				# bare flag
+		*) break ;;
+	esac
+done
+exec "$@"

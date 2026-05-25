@@ -6,6 +6,7 @@
 #   ./ndt.sh                            interactive shell in QEMU (no test)
 #   ./ndt.sh --test=68                  run nvme/068 once
 #   ./ndt.sh --test=68 --iteration=10   run nvme/068 ten times in one boot
+#   ./ndt.sh --kunit                    run the bundled KUnit suites
 #
 # In test mode, the guest init parses ndt.test=NNN ndt.iter=K from
 # /proc/cmdline, runs ./check nvme/NNN K times, and emits one NDT_RESULT
@@ -45,9 +46,11 @@ usage() {
 
 test_num=""
 iters=1
+kunit_mode=0
 for arg in "$@"; do
     case "$arg" in
         -h|--help)        usage 0 1 ;;
+        --kunit)          kunit_mode=1 ;;
         --test=*)         test_num="${arg#--test=}" ;;
         --iteration=*)    iters="${arg#--iteration=}" ;;
         -t|-i)            echo "[ndt] use --test=N / --iteration=N (= form)" >&2; usage ;;
@@ -55,23 +58,27 @@ for arg in "$@"; do
     esac
 done
 
-if [[ -z "$test_num" ]]; then
+if (( kunit_mode )); then
+    # KUnit mode -> init insmods the bundled nps-*-test.ko and emits a
+    # pass/fail/skip sentinel.  Single boot, no blktests device setup.
+    iters=1
+    blktest="kunit"
+elif [[ -z "$test_num" ]]; then
     # No test requested -> hand the user a plain QEMU session.  Init sees
     # the missing ndt.test on cmdline and execs /bin/bash on the console.
-    APPEND="console=ttyS0 panic=-1 memmap=64K\$0x100000000 nvme.poll_queues=4" \
+    APPEND="console=ttyS0 panic=-1 memmap=64K\$0x100000000 nvme.poll_queues=4 nvme_core.multipath=0" \
     NDT_INTERACTIVE=1 \
         exec "$NDT/scripts/run-qemu.sh"
+else
+    if ! [[ "$test_num" =~ ^[0-9]+$ ]]; then
+        echo "[ndt] bad --test: $test_num" >&2; usage
+    fi
+    if ! [[ "$iters" =~ ^[0-9]+$ ]] || (( iters < 1 )); then
+        echo "[ndt] bad --iteration: $iters" >&2; usage
+    fi
+    nn=$(printf '%03d' "$((10#$test_num))")
+    blktest="nvme/$nn"
 fi
-
-if ! [[ "$test_num" =~ ^[0-9]+$ ]]; then
-    echo "[ndt] bad --test: $test_num" >&2; usage
-fi
-if ! [[ "$iters" =~ ^[0-9]+$ ]] || (( iters < 1 )); then
-    echo "[ndt] bad --iteration: $iters" >&2; usage
-fi
-
-nn=$(printf '%03d' "$((10#$test_num))")
-blktest="nvme/$nn"
 
 # --- run-id + dir layout ----------------------------------------------------
 
@@ -107,7 +114,12 @@ rm -f /tmp/qemu-serial.sock /tmp/qemu-ctrl.sock
 per_iter=${NDT_PER_ITER_SEC:-600}
 budget=$(( iters * per_iter + 120 ))
 
-APPEND="console=ttyS0 panic=-1 memmap=64K\$0x100000000 nvme.poll_queues=4 ndt.test=$nn ndt.iter=$iters" \
+if (( kunit_mode )); then
+    cmd_test="ndt.kunit=1"
+else
+    cmd_test="ndt.test=$nn ndt.iter=$iters"
+fi
+APPEND="console=ttyS0 panic=-1 memmap=64K\$0x100000000 nvme.poll_queues=4 nvme_core.multipath=0 $cmd_test" \
     "$NDT/scripts/run-qemu.sh" > "$qlog" 2>&1 &
 qemu_pid=$!
 
@@ -194,7 +206,10 @@ if [[ -n "$result_line" ]]; then
                 skip=*) skip=${kv#skip=} ;;
             esac
         done
-        if (( pass == iters && fail == 0 && skip == 0 )); then
+        if (( kunit_mode )); then
+            # KUnit reports total tests passed, not per-iteration.
+            (( pass > 0 && fail == 0 && skip == 0 )) && verdict="PASS"
+        elif (( pass == iters && fail == 0 && skip == 0 )); then
             verdict="PASS"
         fi
     fi
