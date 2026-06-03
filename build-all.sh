@@ -19,7 +19,7 @@ NDT=$(cd "$(dirname "$0")" && pwd)
 export NDT
 
 "$NDT/scripts/build-kernel.sh"
-"$NDT/scripts/build-nvmet-pci-sw.sh"
+"$NDT/scripts/build-vnvme.sh"
 "$NDT/scripts/build-qemu.sh"
 "$NDT/scripts/build-blktests.sh"
 "$NDT/scripts/build-nvme-cli.sh"

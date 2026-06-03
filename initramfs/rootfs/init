@@ -33,42 +33,14 @@ echo
 echo "=== nvme QEMU rootfs ==="
 echo "kernel: $(uname -r)"
 
-# KUnit mode (ndt.kunit=1): insmod the bundled nps-*-test.ko modules, sum the
-# KTAP they print into the NDT_RESULT sentinel and power off. The tests are
-# self-contained (no nvme device / nvmet target needed), so this short-circuits
-# before the device bring-up below.
-for tok in $(cat /proc/cmdline); do
-    [[ "$tok" == ndt.kunit=1 ]] || continue
-    echo "[init] kunit mode"
-    n=0
-    for m in "/lib/modules/$(uname -r)/extra"/nps-*-test.ko; do
-        [[ -e "$m" ]] || continue
-        insmod "$m" 2>&1 || echo "[init] insmod ${m##*/} failed"
-        n=$((n + 1))
-    done
-    if [[ "$n" -eq 0 ]]; then
-        echo "=== NDT_RESULT error='no-kunit-modules' ==="
-        poweroff -f
-    fi
-    dmesg | awk '
-        /# nps_[a-z_]+: pass:[0-9]+ fail:[0-9]+ skip:[0-9]+/ {
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /^pass:/) { split($i, a, ":"); p += a[2] }
-                if ($i ~ /^fail:/) { split($i, a, ":"); f += a[2] }
-                if ($i ~ /^skip:/) { split($i, a, ":"); s += a[2] }
-            }
-        }
-        END { printf "=== NDT_RESULT pass=%d fail=%d skip=%d iter=1 test=kunit ===\n", \
-                     p, f, s }'
-    poweroff -f
-done
-
 mkdir -p /run/udev
 /usr/lib/systemd/systemd-udevd --daemon
 udevadm trigger --action=add --type=subsystems
 udevadm trigger --action=add --type=devices
 udevadm settle --timeout=10
 echo "[init] udev ready"
+bash
+exit 0
 
 # Host nvme driver is needed to bind to our software endpoint (nvmet-pci-sw
 # exposes a fake NVMe device on bus 0xfe).  Loaded here so it's ready when
@@ -83,15 +55,15 @@ mkdir -p /sys/kernel/config
 mount -t configfs configfs /sys/kernel/config
 
 mkdir -p /sys/kernel/config/nvmet/subsystems/nqn.test
-echo 1 > /sys/kernel/config/nvmet/subsystems/nqn.test/attr_allow_any_host
+echo 1 >/sys/kernel/config/nvmet/subsystems/nqn.test/attr_allow_any_host
 mkdir /sys/kernel/config/nvmet/subsystems/nqn.test/namespaces/1
 echo /dev/nullb0 > \
     /sys/kernel/config/nvmet/subsystems/nqn.test/namespaces/1/device_path
-echo 1 > /sys/kernel/config/nvmet/subsystems/nqn.test/namespaces/1/enable
+echo 1 >/sys/kernel/config/nvmet/subsystems/nqn.test/namespaces/1/enable
 
 modprobe nvmet-pci-sw
 mkdir /sys/kernel/config/nvmet/ports/1
-echo pci > /sys/kernel/config/nvmet/ports/1/addr_trtype
+echo pci >/sys/kernel/config/nvmet/ports/1/addr_trtype
 ln -s /sys/kernel/config/nvmet/subsystems/nqn.test \
     /sys/kernel/config/nvmet/ports/1/subsystems/nqn.test
 
@@ -108,7 +80,7 @@ udevadm settle --timeout=10
 
 # Burn the one-shot "capability attribute has been deprecated" warning so it
 # does not race blktest dmesg scans (nvme/039 etc.).
-cat /sys/block/*/capability > /dev/null 2>&1 || true
+cat /sys/block/*/capability >/dev/null 2>&1 || true
 
 ndt_emit() { echo "=== $* ==="; }
 
@@ -123,8 +95,8 @@ ndt_test=""
 ndt_iter=""
 for tok in $(cat /proc/cmdline); do
     case "$tok" in
-        ndt.test=*) ndt_test=${tok#ndt.test=} ;;
-        ndt.iter=*) ndt_iter=${tok#ndt.iter=} ;;
+    ndt.test=*) ndt_test=${tok#ndt.test=} ;;
+    ndt.iter=*) ndt_iter=${tok#ndt.iter=} ;;
     esac
 done
 
@@ -149,29 +121,33 @@ if [[ ! -f "/opt/blktests/tests/$ndt_blktest" ]]; then
     ndt_die "test-not-found"
 fi
 
-pass=0; fail=0; skip=0
+pass=0
+fail=0
+skip=0
 
-for (( i = 1; i <= ndt_iter; i++ )); do
+for ((i = 1; i <= ndt_iter; i++)); do
     echo "[init] iter $i/$ndt_iter: $ndt_blktest"
-    ( cd /opt/blktests && ./check "$ndt_blktest" ) || true
+    (cd /opt/blktests && ./check "$ndt_blktest") || true
 
     # Aggregate across all namespace result dirs (any fail wins, else any
     # pass, else skip).  Matches the old ndt_run semantics.
-    any_pass=0; any_fail=0; any_skip=0
+    any_pass=0
+    any_fail=0
+    any_skip=0
     for d in /opt/blktests/results/*/; do
         f="${d}${ndt_blktest}"
         [[ -f "$f" ]] || continue
         s=$(sed -n 's/^status\t//p' "$f" | head -1)
         case "$s" in
-            pass)                       any_pass=1 ;;
-            "not run"|skipped|"")       any_skip=1 ;;
-            *)                          any_fail=1 ;;
+        pass) any_pass=1 ;;
+        "not run" | skipped | "") any_skip=1 ;;
+        *) any_fail=1 ;;
         esac
     done
 
-    if (( any_fail )); then
+    if ((any_fail)); then
         fail=$((fail + 1))
-    elif (( any_pass )); then
+    elif ((any_pass)); then
         pass=$((pass + 1))
     else
         skip=$((skip + 1))

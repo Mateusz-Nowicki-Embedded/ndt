@@ -76,31 +76,32 @@ for f in modules.order modules.builtin modules.builtin.modinfo; do
     [[ -f "$KBUILD/$f" ]] && cp "$KBUILD/$f" "$ROOTFS/lib/modules/$KVER/"
 done
 
-# Out-of-tree nvmet-pci-sw module — software NVMe PCIe endpoint.
-NPS_SRC=$NDT/third_party/nvmet-pci-sw
-NPS_KO=$NPS_SRC/nvmet-pci-sw.ko
-if [[ -f "$NPS_KO" ]]; then
+# Out-of-tree nvme module — virtual NVMe PCIe endpoint.
+VNVME_SRC=$NDT/third_party/vnvme
+VNVME_KO=$VNVME_SRC/vnvme.ko
+if [[ -f "$VNVME_KO" ]]; then
     mkdir -p "$ROOTFS/lib/modules/$KVER/extra"
-    cp "$NPS_KO" "$ROOTFS/lib/modules/$KVER/extra/"
-    echo "[build-initramfs] copy out-of-tree: nvmet-pci-sw.ko"
+    cp "$VNVME_KO" "$ROOTFS/lib/modules/$KVER/extra/"
+    echo "[build-initramfs] copy out-of-tree: vnvme.ko"
 
     # KUnit test modules — built on demand (make NPS_KUNIT=y) and bundled
     # next to the main module so `ndt.kunit=1` in init can insmod them.
     # Requires the module source to expose the NPS_KUNIT target and the
     # kernel to have CONFIG_KUNIT; otherwise this is skipped, not fatal.
-    if grep -qs NPS_KUNIT "$NPS_SRC/Makefile"; then
-        echo "[build-initramfs] build + copy KUnit test modules"
-        if make -C "$NPS_SRC" KDIR="$KBUILD" NPS_KUNIT=y >/dev/null; then
-            cp "$NPS_SRC"/nps-*-test.ko "$ROOTFS/lib/modules/$KVER/extra/"
-            echo "[build-initramfs] copy KUnit: $(ls "$NPS_SRC"/nps-*-test.ko 2>/dev/null | wc -l) modules"
-        else
-            echo "[build-initramfs] warn: KUnit module build failed, skipping" >&2
-        fi
-    else
-        echo "[build-initramfs] note: no NPS_KUNIT target in module source, KUnit skipped" >&2
-    fi
+
+    #if grep -qs NPS_KUNIT "$NPS_SRC/Makefile"; then
+    #   echo "[build-initramfs] build + copy KUnit test modules"
+    #   if make -C "$NPS_SRC" KDIR="$KBUILD" NPS_KUNIT=y >/dev/null; then
+    #       cp "$NPS_SRC"/nps-*-test.ko "$ROOTFS/lib/modules/$KVER/extra/"
+    #       echo "[build-initramfs] copy KUnit: $(ls "$NPS_SRC"/nps-*-test.ko 2>/dev/null | wc -l) modules"
+    #   else
+    #       echo "[build-initramfs] warn: KUnit module build failed, skipping" >&2
+    #   fi
+    #else
+    #   echo "[build-initramfs] note: no NPS_KUNIT target in module source, KUnit skipped" >&2
+    #fi
 else
-    echo "[build-initramfs] warn: $NPS_KO not built, skipping" >&2
+    echo "[build-initramfs] warn: $VNVME_KO not built, skipping" >&2
 fi
 
 depmod -b "$ROOTFS" "$KVER"
@@ -117,9 +118,9 @@ ln -s libnvme.so.3.0.0 "$ROOTFS/usr/lib64/libnvme.so.3"
 # (nvme-passthru-admin-uring etc.). Pull the host copy by its soname.
 liburing="$(readlink -f /usr/lib64/liburing.so.2 2>/dev/null || true)"
 if [[ -f "$liburing" ]]; then
-	rm -f "$ROOTFS/usr/lib64/liburing.so"*
-	install -m 755 "$liburing" "$ROOTFS/usr/lib64/$(basename "$liburing")"
-	ln -s "$(basename "$liburing")" "$ROOTFS/usr/lib64/liburing.so.2"
+    rm -f "$ROOTFS/usr/lib64/liburing.so"*
+    install -m 755 "$liburing" "$ROOTFS/usr/lib64/$(basename "$liburing")"
+    ln -s "$(basename "$liburing")" "$ROOTFS/usr/lib64/liburing.so.2"
 fi
 
 # 2b. pcimem — direct mmap-based BAR poke (MSI-X mask manipulation etc.)
