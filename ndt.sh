@@ -26,6 +26,11 @@
 #
 # Symlink /tmp/ndt/latest points at the newest run-id.
 #
+# Env overrides:
+#   APPEND="..."        replace the entire kernel cmdline
+#   QEMU_EXTRA="-s -S"  extra QEMU args (gdbstub + stop-at-start)
+#   NDT_PER_ITER_SEC=N  per-iteration wallclock budget (default 600)
+#
 # Exit codes:
 #   0   pass == K and fail == 0
 #   1   any fail, skip, error, or sentinel missing
@@ -40,6 +45,64 @@ usage() {
     local rc=${1:-2} dest=${2:-2}
     awk 'NR==1{next} /^#/{sub(/^#[ \t]?/,""); print; next} {exit}' "$0" >&"$dest"
     exit "$rc"
+}
+
+# --- QEMU launch (folded in from the old scripts/run-qemu.sh) ---------------
+# No QEMU-emulated NVMe device — the test target is nvmet-pci-sw, which lives
+# entirely inside the guest kernel; null_blk backs its namespaces.  Q35 keeps
+# the PCIe root complex (the module's virtual bridge lives under bus 0xfe).
+
+QEMU_BIN="$NDT/build/qemu-host/qemu-system-x86_64"
+if [[ ! -x "$QEMU_BIN" ]]; then
+    echo "[ndt] $QEMU_BIN not found, falling back to system qemu-system-x86_64" >&2
+    QEMU_BIN=qemu-system-x86_64
+fi
+BZIMAGE="$NDT/build/linux/arch/x86/boot/bzImage"
+INITRAMFS="$NDT/initramfs/initramfs.cpio.gz"
+
+# The one and only base kernel cmdline.  memmap=64K$0x100000000 carves 64 KiB
+# out of high RAM to back the module's BAR0 (modules/nvmet-pci-sw/bar.c; the
+# literal '$' is escaped so the shell doesn't expand $0).  Callers append only
+# the test selector (ndt.test=/ndt.iter=/ndt.kunit=).  Full override: APPEND=.
+base_cmdline="console=ttyS0 panic=-1 memmap=64K\$0x100000000"
+
+assert_artifacts() {
+    local f
+    for f in "$BZIMAGE" "$INITRAMFS"; do
+        [[ -f "$f" ]] && continue
+        echo "[ndt] missing artifact: $f" >&2
+        echo "[ndt] hint: run ./build-all.sh first" >&2
+        exit 2
+    done
+}
+
+# boot_qemu <serial-mode> <cmdline-extra> [extra qemu args...]
+#   stdio   -> -serial mon:stdio   foreground; user types into the guest shell
+#                                  (Ctrl-A x exits, Ctrl-A c flips to monitor)
+#   socket  -> -serial unix:...    ndt attaches via socat to scrape NDT_RESULT
+boot_qemu() {
+    local mode=$1 extra=$2; shift 2
+    local append=${APPEND:-"$base_cmdline${extra:+ $extra}"}
+    local serial
+    case "$mode" in
+        stdio)  serial=( -serial mon:stdio ) ;;
+        socket) serial=( -serial unix:/tmp/qemu-serial.sock,server,nowait ) ;;
+        *)      echo "[ndt] boot_qemu: bad serial mode '$mode'" >&2; exit 2 ;;
+    esac
+    "$QEMU_BIN" \
+        -machine q35 \
+        -kernel "$BZIMAGE" \
+        -initrd "$INITRAMFS" \
+        -append "$append" \
+        -nographic \
+        -m 8G \
+        -smp 16 \
+        "${serial[@]}" \
+        -display none \
+        -no-reboot \
+        -cpu host -enable-kvm \
+        ${QEMU_EXTRA:-} \
+        "$@"
 }
 
 # --- arg parsing ------------------------------------------------------------
@@ -66,9 +129,10 @@ if (( kunit_mode )); then
 elif [[ -z "$test_num" ]]; then
     # No test requested -> hand the user a plain QEMU session.  Init sees
     # the missing ndt.test on cmdline and execs /bin/bash on the console.
-    APPEND="console=ttyS0 panic=-1 memmap=64K\$0x100000000" \
-    NDT_INTERACTIVE=1 \
-        exec "$NDT/scripts/run-qemu.sh"
+    # Serial on stdio so the user can type straight into the guest shell.
+    assert_artifacts
+    boot_qemu stdio ""
+    exit $?
 else
     if ! [[ "$test_num" =~ ^[0-9]+$ ]]; then
         echo "[ndt] bad --test: $test_num" >&2; usage
@@ -107,7 +171,7 @@ summary=$RUN_DIR/summary.txt
 
 # --- boot QEMU --------------------------------------------------------------
 
-rm -f /tmp/qemu-serial.sock /tmp/qemu-ctrl.sock
+rm -f /tmp/qemu-serial.sock
 
 # Per-iter wallclock budget plus a generous boot/shutdown headroom.
 # 600 s per iter matches the blktests cap; bump via $NDT_PER_ITER_SEC if needed.
@@ -119,8 +183,8 @@ if (( kunit_mode )); then
 else
     cmd_test="ndt.test=$nn ndt.iter=$iters"
 fi
-APPEND="console=ttyS0 panic=-1 memmap=64K\$0x100000000  $cmd_test" \
-    "$NDT/scripts/run-qemu.sh" > "$qlog" 2>&1 &
+assert_artifacts
+boot_qemu socket "$cmd_test" > "$qlog" 2>&1 &
 qemu_pid=$!
 
 # Wait for QEMU to publish the serial socket.
