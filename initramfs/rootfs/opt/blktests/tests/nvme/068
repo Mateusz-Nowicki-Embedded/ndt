@@ -71,6 +71,10 @@ test_device() {
 		return 1
 	fi
 
+	# If interrupted while the controller is detached, restore a sane state
+	# (Memory Space Enable on, driver rebound). Cleared on the normal path below.
+	trap 'setpci -s "${pdev}" COMMAND.w=2:2 2>/dev/null; echo -n "${pdev}" > /sys/bus/pci/drivers/nvme/bind 2>/dev/null; exit 1' INT TERM
+
 	# Detach the nvme driver so it does not race the Memory Space Enable toggle.
 	echo -n "${pdev}" > /sys/bus/pci/drivers/nvme/unbind
 
@@ -88,12 +92,15 @@ test_device() {
 	restored="$(_pcimem_read32 "$resource" "$NVME_REG_VS")"
 	echo "VS after restore: ${restored:-<none>}" >> "$FULL"
 
-	# Re-attach the nvme driver and wait for the namespace to reappear.
+	# Re-attach the nvme driver and wait for the namespace to reappear. State is
+	# now restored, so drop the interrupt handler installed above.
 	echo -n "${pdev}" > /sys/bus/pci/drivers/nvme/bind 2>/dev/null
+	trap - INT TERM
 	for ((i = 0; i < 20; i++)); do
 		[[ -b ${TEST_DEV} ]] && break
 		sleep .5
 	done
+	udevadm settle
 
 	# Evaluate. Comparisons are case-folded since pcimem prints uppercase hex.
 	if [[ -z "$base" || "${base^^}" == "0XFFFFFFFF" ]]; then

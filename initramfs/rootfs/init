@@ -3,11 +3,13 @@
 # interactive fallback when no test is requested.
 #
 # Flow:
-#   1. mounts + udev + modprobe chain -> /dev/nvme0n1 backed by nvmet-pci-sw
+#   1. mounts + udev + base modprobe chain (nvme, null_blk, nvmet, configfs)
 #   2. parse ndt.test=NNN ndt.iter=K from /proc/cmdline
-#   3. no ndt.test -> exec /bin/bash (interactive console, no auto-poweroff)
-#   4. otherwise run ./check nvme/NNN K times, aggregate pass/fail/skip,
-#      emit NDT_RESULT sentinel on ttyS0, poweroff -f
+#   3. no ndt.test -> exec /bin/bash.  The device is NOT brought up and no
+#      helper runs (neither /vnvme_load.sh nor /hotplug.sh) — do it by hand.
+#   4. otherwise bring up the vnvme endpoint via /vnvme_load.sh, wait for
+#      /dev/nvme0n1, run ./check nvme/NNN K times, aggregate pass/fail/skip,
+#      emit the NDT_RESULT sentinel on ttyS0, poweroff -f
 #
 # Report format on ttyS0 (one line, parsed by host):
 #   === NDT_RESULT pass=X fail=Y skip=Z iter=K test=nvme/NNN ===
@@ -40,29 +42,123 @@ udevadm trigger --action=add --type=devices
 udevadm settle --timeout=10
 echo "[init] udev ready"
 
-# Host nvme driver is needed to bind to our software endpoint (nvmet-pci-sw
-# exposes a fake NVMe device on bus 0xfe).  Loaded here so it's ready when
-# the module brings the bridge up.
+# Base chain needed by both modes: host nvme driver (binds the vnvme
+# endpoint), null_blk (backing namespace), nvmet + configfs (target API).
+# The vnvme endpoint itself is NOT loaded here — that is /vnvme_load.sh's
+# job, run only in test mode (or by hand in an interactive session).
 modprobe nvme
-
-# Auto-build the nvmet target chain that backs our endpoint: null_blk
-# provides the namespace, nvmet exposes it, nvmet-pci-sw plugs into both.
 modprobe null_blk nr_devices=1
 modprobe nvmet
+modprobe configfs 2>/dev/null || true
 mkdir -p /sys/kernel/config
-mount -t configfs configfs /sys/kernel/config
+mount -t configfs configfs /sys/kernel/config 2>/dev/null || true
 
-#mkdir -p /sys/kernel/config/nvmet/subsystems/vnvme-ss
-#echo 1 > /sys/kernel/config/nvmet/subsystems/vnvme-ss/attr_allow_any_host
-#mkdir /sys/kernel/config/nvmet/subsystems/vnvme-ss/namespaces/1
-#echo /dev/nullb0 > /sys/kernel/config/nvmet/subsystems/vnvme-ss/namespaces/1/device_path
-#echo 1 > /sys/kernel/config/nvmet/subsystems/vnvme-ss/namespaces/1/enable
+ndt_emit() { echo "=== $* ==="; }
 
-#exec /nvmve_load.sh
+ndt_die() {
+    ndt_emit "NDT_RESULT error='$1'"
+    poweroff -f
+    exit 0
+}
 
-#mkdir /sys/kernel/config/nvmet/ports/1
-#echo -n pci > /sys/kernel/config/nvmet/ports/1/addr_trtype
-#ln -s /sys/kernel/config/nvmet/subsystems/vnvme-ss /sys/kernel/config/nvmet/ports/1/subsystems/vnvme-ss
+# Parse ndt.test=NNN and ndt.iter=K from /proc/cmdline.
+ndt_test=""
+ndt_iter=""
+for tok in $(cat /proc/cmdline); do
+    case "$tok" in
+    ndt.test=*) ndt_test=${tok#ndt.test=} ;;
+    ndt.iter=*) ndt_iter=${tok#ndt.iter=} ;;
+    esac
+done
 
-exec /bin/bash
+# No ndt.test on cmdline -> interactive QEMU session.  Deliberately leave the
+# device down: no /vnvme_load.sh, no /hotplug.sh.  The base modules are loaded
+# and configfs is mounted, so run /vnvme_load.sh yourself to get /dev/nvme0n1.
+# Type `poweroff -f` to exit.
+if [[ -z "$ndt_test" ]]; then
+    echo
+    echo "[init] no ndt.test on cmdline — interactive session"
+    echo "[init] device NOT loaded; run /vnvme_load.sh by hand to bring up /dev/nvme0n1"
+    echo "[init] 'poweroff -f' to exit"
+    echo
+    exec /bin/bash
+fi
+
+# --- test mode --------------------------------------------------------------
+
+[[ -z "$ndt_iter" ]] && ndt_die "missing-or-bad-cmdline"
+[[ "$ndt_test" =~ ^[0-9]+$ ]] || ndt_die "missing-or-bad-cmdline"
+[[ "$ndt_iter" =~ ^[0-9]+$ && "$ndt_iter" -gt 0 ]] || ndt_die "missing-or-bad-cmdline"
+
+ndt_blktest="nvme/$ndt_test"
+
+if [[ ! -f "/opt/blktests/tests/$ndt_blktest" ]]; then
+    ndt_die "test-not-found"
+fi
+
+# Bring up the vnvme PCI endpoint -> the host nvme driver binds it and
+# publishes /dev/nvme0n1 (blktests config points TEST_DEVS there).
+if ! /vnvme_load.sh; then
+    ndt_die "vnvme-load-failed"
+fi
+
+# vnvme starts with an empty pciehp slot; the endpoint is presented only after
+# the hotplug trigger.  Drive it so the NVMe function appears and the host nvme
+# driver binds it.  (Interactive mode skips this on purpose — do it by hand.)
+if [[ ! -e /sys/kernel/config/vnvme/hotplug ]]; then
+    ndt_die "no-vnvme-configfs"
+fi
+echo 1 > /sys/kernel/config/vnvme/hotplug
+
+# Wait for the block device — tests assume /dev/nvme0n1 exists.  The vnvme
+# endpoint is the only NVMe controller present, so it always gets nvme0.
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -e /dev/nvme0n1 ] && break
+    sleep 0.5
+done
+[ -e /dev/nvme0n1 ] || ndt_die "no-nvme0n1"
+
+udevadm settle --timeout=10
+
+# Burn the one-shot "capability attribute has been deprecated" warning so it
+# does not race blktest dmesg scans (nvme/039 etc.).
+cat /sys/block/*/capability >/dev/null 2>&1 || true
+
+pass=0
+fail=0
+skip=0
+
+for ((i = 1; i <= ndt_iter; i++)); do
+    echo "[init] iter $i/$ndt_iter: $ndt_blktest"
+    (cd /opt/blktests && ./check "$ndt_blktest") || true
+
+    # Aggregate across all namespace result dirs (any fail wins, else any
+    # pass, else skip).  Matches the old ndt_run semantics.
+    any_pass=0
+    any_fail=0
+    any_skip=0
+    for d in /opt/blktests/results/*/; do
+        f="${d}${ndt_blktest}"
+        [[ -f "$f" ]] || continue
+        s=$(sed -n 's/^status\t//p' "$f" | head -1)
+        case "$s" in
+        pass) any_pass=1 ;;
+        "not run" | skipped | "") any_skip=1 ;;
+        *) any_fail=1 ;;
+        esac
+    done
+
+    if ((any_fail)); then
+        fail=$((fail + 1))
+    elif ((any_pass)); then
+        pass=$((pass + 1))
+    else
+        skip=$((skip + 1))
+    fi
+
+    # Wipe results so next iter doesn't fold previous status in.
+    rm -rf /opt/blktests/results/*
+done
+
+ndt_emit "NDT_RESULT pass=$pass fail=$fail skip=$skip iter=$ndt_iter test=$ndt_blktest"
 poweroff -f

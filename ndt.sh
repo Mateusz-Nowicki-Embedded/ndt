@@ -4,9 +4,20 @@
 #
 # Usage:
 #   ./ndt.sh                            interactive shell in QEMU (no test)
-#   ./ndt.sh --test=68                  run nvme/068 once
-#   ./ndt.sh --test=68 --iteration=10   run nvme/068 ten times in one boot
+#   ./ndt.sh 68                         run nvme/068 once (positional)
+#   ./ndt.sh 68 10                      run nvme/068 ten times in one boot
+#   ./ndt.sh --test=68 --iteration=10   same, long form
+#   ./ndt.sh 68 --follow                run + stream the guest console live
 #   ./ndt.sh --kunit                    run the bundled KUnit suites
+#   ./ndt.sh --last                     show the latest run's summary + tail
+#
+# Test selectors accept 68, 068 or nvme/068 interchangeably.
+#
+# Flags:
+#   -f, --follow     stream console.log live instead of a progress line
+#       --last       print the latest run's summary + console tail, then exit
+#       --kunit      run KUnit suites instead of a blktests case
+#   -h, --help       this help
 #
 # In test mode, the guest init parses ndt.test=NNN ndt.iter=K from
 # /proc/cmdline, runs ./check nvme/NNN K times, and emits one NDT_RESULT
@@ -14,7 +25,7 @@
 # dir, boots QEMU, captures the serial console, scrapes the sentinel, and
 # exits 0/1.
 #
-# In interactive mode (no --test), QEMU runs in the foreground with serial
+# In interactive mode (no test), QEMU runs in the foreground with serial
 # on stdio.  Init does the same modprobe chain, then execs /bin/bash on
 # the console.  Type `poweroff -f` (or Ctrl-A x) to exit.
 #
@@ -47,6 +58,13 @@ usage() {
     exit "$rc"
 }
 
+# --- colors (only when stdout is a terminal) --------------------------------
+if [[ -t 1 ]]; then
+    C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_BOLD=$'\033[1m'; C_RST=$'\033[0m'
+else
+    C_RED=""; C_GRN=""; C_BOLD=""; C_RST=""
+fi
+
 # --- QEMU launch (folded in from the old scripts/run-qemu.sh) ---------------
 # No QEMU-emulated NVMe device — the test target is nvmet-pci-sw, which lives
 # entirely inside the guest kernel; null_blk backs its namespaces.  Q35 keeps
@@ -64,7 +82,7 @@ INITRAMFS="$NDT/initramfs/initramfs.cpio.gz"
 # out of high RAM to back the module's BAR0 (modules/nvmet-pci-sw/bar.c; the
 # literal '$' is escaped so the shell doesn't expand $0).  Callers append only
 # the test selector (ndt.test=/ndt.iter=/ndt.kunit=).  Full override: APPEND=.
-base_cmdline="console=ttyS0 panic=-1 memmap=64K\$0x100000000"
+base_cmdline="console=ttyS0 panic=-1 memmap=64K\$0x100000000 nvme_core.multipath=0"
 
 assert_artifacts() {
     local f
@@ -74,6 +92,21 @@ assert_artifacts() {
         echo "[ndt] hint: run ./build-all.sh first" >&2
         exit 2
     done
+}
+
+# Cheap sanity checks so failures surface here, not deep inside qemu.log.
+# $1 = also require socat (1 for test mode, 0 for interactive).
+preflight() {
+    if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+        echo "[ndt] /dev/kvm not accessible — KVM acceleration unavailable." >&2
+        echo "[ndt] hint: add yourself to the 'kvm' group (usermod -aG kvm \$USER), then re-login." >&2
+        exit 2
+    fi
+    if (( ${1:-0} )) && ! command -v socat >/dev/null 2>&1; then
+        echo "[ndt] socat not found — needed to capture the guest console." >&2
+        echo "[ndt] hint: install socat (apt install socat / emerge net-misc/socat)." >&2
+        exit 2
+    fi
 }
 
 # boot_qemu <serial-mode> <cmdline-extra> [extra qemu args...]
@@ -108,18 +141,59 @@ boot_qemu() {
 # --- arg parsing ------------------------------------------------------------
 
 test_num=""
-iters=1
+iters=""
 kunit_mode=0
+follow=0
+show_last=0
+positional=()
 for arg in "$@"; do
     case "$arg" in
         -h|--help)        usage 0 1 ;;
         --kunit)          kunit_mode=1 ;;
+        -f|--follow)      follow=1 ;;
+        --last|--show)    show_last=1 ;;
         --test=*)         test_num="${arg#--test=}" ;;
         --iteration=*)    iters="${arg#--iteration=}" ;;
-        -t|-i)            echo "[ndt] use --test=N / --iteration=N (= form)" >&2; usage ;;
-        *)                echo "[ndt] unknown arg: $arg" >&2; usage ;;
+        -t|-i)            echo "[ndt] use --test=N / --iteration=N, or positional: ndt.sh N [iters]" >&2; usage ;;
+        -*)               echo "[ndt] unknown option: $arg" >&2; usage ;;
+        *)                positional+=("$arg") ;;
     esac
 done
+
+# Positional fallthrough: ndt.sh <test> [iters]
+if [[ -z "$test_num" && ${#positional[@]} -ge 1 ]]; then
+    test_num="${positional[0]}"
+fi
+if [[ -z "$iters" && ${#positional[@]} -ge 2 ]]; then
+    iters="${positional[1]}"
+fi
+iters="${iters:-1}"
+test_num="${test_num#nvme/}"   # accept nvme/068 as well as 068 / 68
+
+# --- --last: show the most recent run, then exit ----------------------------
+
+if (( show_last )); then
+    if [[ ! -L /tmp/ndt/latest ]]; then
+        echo "[ndt] no runs recorded under /tmp/ndt/" >&2; exit 2
+    fi
+    d=$(readlink -f /tmp/ndt/latest)
+    if [[ ! -d "$d" ]]; then
+        echo "[ndt] /tmp/ndt/latest is dangling -> $d" >&2; exit 2
+    fi
+    if [[ -f "$d/summary.txt" ]]; then
+        cat "$d/summary.txt"
+    else
+        echo "[ndt] no summary.txt in $d (interactive run, or it crashed early)" >&2
+    fi
+    if [[ -f "$d/console.log" ]]; then
+        echo
+        echo "--- last 40 lines of console.log ($d) ---"
+        tail -n 40 "$d/console.log"
+    fi
+    exit 0
+fi
+
+# --- mode dispatch ----------------------------------------------------------
 
 if (( kunit_mode )); then
     # KUnit mode -> init insmods the bundled nps-*-test.ko and emits a
@@ -131,14 +205,16 @@ elif [[ -z "$test_num" ]]; then
     # the missing ndt.test on cmdline and execs /bin/bash on the console.
     # Serial on stdio so the user can type straight into the guest shell.
     assert_artifacts
+    preflight 0
+    echo "[ndt] booting interactive QEMU — 'poweroff -f' or Ctrl-A x to exit"
     boot_qemu stdio ""
     exit $?
 else
     if ! [[ "$test_num" =~ ^[0-9]+$ ]]; then
-        echo "[ndt] bad --test: $test_num" >&2; usage
+        echo "[ndt] bad test number: $test_num" >&2; usage
     fi
     if ! [[ "$iters" =~ ^[0-9]+$ ]] || (( iters < 1 )); then
-        echo "[ndt] bad --iteration: $iters" >&2; usage
+        echo "[ndt] bad iteration count: $iters" >&2; usage
     fi
     nn=$(printf '%03d' "$((10#$test_num))")
     blktest="nvme/$nn"
@@ -171,7 +247,22 @@ summary=$RUN_DIR/summary.txt
 
 # --- boot QEMU --------------------------------------------------------------
 
+preflight 1
 rm -f /tmp/qemu-serial.sock
+
+# Kill QEMU / socat / tail on any exit (including Ctrl-C) so an aborted run
+# never leaks an 8G QEMU or a stale serial socket.
+qemu_pid=""
+socat_pid=""
+follow_pid=""
+cleanup() {
+    [[ -n "$follow_pid" ]] && kill "$follow_pid" 2>/dev/null
+    [[ -n "$socat_pid" ]] && kill "$socat_pid" 2>/dev/null
+    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
+        kill -9 "$qemu_pid" 2>/dev/null
+    fi
+}
+trap cleanup EXIT INT TERM
 
 # Per-iter wallclock budget plus a generous boot/shutdown headroom.
 # 600 s per iter matches the blktests cap; bump via $NDT_PER_ITER_SEC if needed.
@@ -193,14 +284,22 @@ for _w in $(seq 1 100); do
     sleep 0.1
 done
 if [[ ! -S /tmp/qemu-serial.sock ]]; then
-    echo "[ndt] FAIL: qemu never created serial socket" | tee "$summary"
-    kill "$qemu_pid" 2>/dev/null
-    wait "$qemu_pid" 2>/dev/null
+    echo "[ndt] FAIL: qemu never created serial socket (see $qlog)" | tee "$summary"
     exit 1
 fi
 
 socat -u "UNIX-CONNECT:/tmp/qemu-serial.sock" "OPEN:$console,creat,append" &
 socat_pid=$!
+
+# Live view: stream the console (--follow) or print an in-place progress line.
+progress=0
+if (( follow )); then
+    echo "[ndt] $blktest running — following console (Ctrl-C aborts):"
+    tail -n +1 -f "$console" &
+    follow_pid=$!
+elif [[ -t 2 ]]; then
+    progress=1
+fi
 
 # --- wait for sentinel or timeout / QEMU exit -------------------------------
 
@@ -229,10 +328,13 @@ while :; do
         cause="timeout"
         break
     fi
+    (( progress )) && printf '\r[ndt] %s running… %3ds / %ds budget ' "$blktest" "$dt" "$budget" >&2
     sleep 1
 done
 
 dt=$((EPOCHSECONDS - t0))
+(( progress )) && printf '\r%*s\r' 60 '' >&2          # wipe the progress line
+[[ -n "$follow_pid" ]] && { kill "$follow_pid" 2>/dev/null; follow_pid=""; }
 
 # --- clean shutdown ---------------------------------------------------------
 
@@ -293,10 +395,26 @@ fi
         printf 'pass=%d fail=%d skip=%d (of %d iter)\n' "$pass" "$fail" "$skip" "$iters"
         printf 'verdict: %s\n' "$verdict"
     fi
-} | tee "$summary"
+} > "$summary"
+cat "$summary"
+
+# Colored verdict banner; on failure, show the tail of the console so the
+# next thing a human wants to read is already on screen.
+echo
+if [[ "$verdict" == "PASS" ]]; then
+    printf '%s%s✓ PASS%s  %s  (%ds)\n' "$C_BOLD" "$C_GRN" "$C_RST" "$blktest" "$dt"
+else
+    printf '%s%s✗ FAIL%s  %s  (%ds, cause=%s)\n' "$C_BOLD" "$C_RED" "$C_RST" "$blktest" "$dt" "$cause"
+    if [[ -s "$console" ]]; then
+        echo
+        echo "--- last 30 lines of console.log ---"
+        tail -n 30 "$console"
+    fi
+fi
 
 echo
 echo "[ndt] artifacts: $RUN_DIR/"
 echo "[ndt] symlink:   /tmp/ndt/latest"
+echo "[ndt] re-view:   ./ndt.sh --last"
 
 [[ "$verdict" == "PASS" ]]

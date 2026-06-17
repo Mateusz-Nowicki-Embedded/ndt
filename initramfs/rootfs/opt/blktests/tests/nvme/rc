@@ -72,7 +72,13 @@ group_device_requires() {
 }
 
 _require_test_dev_is_nvme_pci() {
-	if [[ ! "$(readlink -f "$TEST_DEV_SYSFS/device")" =~ devices/pci ]]; then
+	# Gate on whether a PCI BDF is extractable from the device's sysfs path
+	# rather than matching a literal "devices/pci" prefix.  This also accepts
+	# NVMe controllers whose host bridge hangs off a platform device (e.g. the
+	# vnvme emulator: .../devices/platform/vnvme/pciDDDDD:BB/...), which the
+	# old prefix check rejected even though _get_pci_dev_from_blkdev resolves
+	# their BDF fine.
+	if [[ -z "$(_get_pci_dev_from_blkdev)" ]]; then
 		SKIP_REASONS+=("$TEST_DEV is not a PCI NVMe device")
 		return 1
 	fi
