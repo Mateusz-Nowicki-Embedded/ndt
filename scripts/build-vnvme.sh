@@ -9,7 +9,7 @@ KBUILD=$NDT/build/linux
 
 if [[ ! -f "$SRC/Makefile" ]]; then
     echo "[build-vnvme] !!ERROR!!: $SRC/Makefile not found" >&2
-    echo "[build-vnvme] hint: git submodule update --init third_party/fake-pcie-nvme-drive" >&2
+    echo "[build-vnvme] hint: git submodule update --init third_party/vnvme" >&2
     exit 1
 fi
 

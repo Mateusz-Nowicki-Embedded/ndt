@@ -2,174 +2,116 @@
 # SPDX-License-Identifier: GPL-3.0+
 # Copyright (C) 2026 Mateusz Nowicki
 #
-# Stress the NVMe PCI reset path with a burst of admin commands in
-# flight on top of random-rw I/O.
+# Read an NVMe BAR0 register while PCI Memory Space Enable is disabled.
 #
-# Background fio (randrw) exercises the I/O path.  Mid-run the test
-# fires a small burst of `nvme id-ctrl` invocations in parallel
-# (default 8, override by editing NDT_ID_BURST below or setting it
-# in /opt/blktests/config inside the guest).  Each ioctl is synchronous
-# in the caller, but multiple processes stream multiple SQEs into the
-# admin SQ in parallel — admin tagset is a normal blk-mq queue with
-# depth NVME_AQ_BLK_MQ_DEPTH, so the controller mailbox holds them
-# all.  Immediately afterwards the test kicks reset_controller via
-#   /sys/bus/pci/devices/<bdf>/nvme/<nvmeN>/reset_controller
-# which is the PCI-rooted view of the same attribute /sys/class/nvme/
-# exposes; using the PCI path keeps the test specific to nvme-pci.
+# Clearing Memory Space Enable (Command register bit 1, mask 0x02) makes the
+# NVMe function stop decoding its memory BAR. A CPU MMIO read of a BAR0 register
+# then becomes a PCIe Unsupported Request and the (x86) root complex synthesizes
+# all-ones back to the load. This is the same all-ones signature the kernel uses
+# to detect a dead/surprise-removed controller (CSTS == ~0).
 #
-# To make the admin burst actually be "in flight" at reset time
-# (instead of racing to complete before the reset arrives), pair this
-# test with the forked QEMU's per-SQ completion delay on the admin
-# queue, e.g.:
+# The nvme driver is unbound first so it does not observe all-ones on its own
+# MMIO and tear the controller down while we toggle Memory Space Enable.
 #
-#   ./ndt.sh 68 cq-delay=0:30000
-#
-# That holds admin CQEs for 30 s, so reset hits SQEs the controller
-# has not yet posted completions for, exercising the in-flight cancel
-# path (nvme_cancel_tagset on the admin tagset; each pending ioctl
-# returns -EIO).  Without cq-delay the burst still issues admin
-# commands but they generally complete before the reset; the test
-# then degrades to "reset under random-rw I/O" — still useful, just
-# less stressful.
-#
-# Inner iterations (same QEMU session)
-# ------------------------------------
-# If $NDT_INNER_ITER > 1, the test repeats the fio+burst+reset
-# scenario N times within a single ./check invocation (i.e. one QEMU
-# boot).  This is for checking whether one reset affects the next one
-# — e.g. queue accounting leak that only shows after the 3rd reset.
-#
-# Per-iter handshake on the NDT serial sockets (bypassing blktests'
-# stdout so the .out diff stays stable):
-#   guest -> /dev/ttyS0:  === NDT_INNER_ITER iter=N phase='ready' ===
-#   host  -> /dev/ttyS1:  GO    (after re-applying any cq-delay)
-#   guest -> /dev/ttyS0:  === NDT_INNER_ITER iter=N phase='done|fail' ===
-# Because cq-delay does NOT survive a controller reset, the host
-# re-applies it on every iteration's 'ready' before sending GO.
-#
-# Run with e.g.:
-#   ./ndt.sh 68 inner-iter=3 cq-delay=0:5000
+# NOTE: returning 0xFFFFFFFF on an Unsupported Request for a *memory* read is an
+# x86 root-complex convention, not a PCIe spec guarantee (the spec only mandates
+# it for configuration reads / the RP PIO path). Other architectures may instead
+# raise an external abort / SError, so this test is restricted to x86_64.
 
 . tests/nvme/rc
 
+DESCRIPTION="read NVMe BAR0 register with PCI Memory Space Enable disabled"
+
+# restrict test to nvme-pci only
 nvme_trtype=pci
 
-DESCRIPTION="reset controller during random RW I/O with admin cmds in flight"
-QUICK=1
-CAN_BE_ZONED=1
+# NVMe controller register offset within BAR0 (NVMe base spec). VS (Version) is
+# read-only and normally non-zero, so it is never legitimately 0xFFFFFFFF.
+NVME_REG_VS=0x08
 
-NDT_ID_BURST=${NDT_ID_BURST:-8}
-NDT_INNER_ITER=${NDT_INNER_ITER:-1}
+# Read a 32-bit register at offset $2 from resource file $1 via pcimem and echo
+# the value as 0x........ (uppercase). Echoes nothing and returns non-zero on
+# failure. All of pcimem's chatter is captured into $FULL, not stdout.
+_pcimem_read32() {
+	local resource="$1" off="$2"
+	local out
+
+	out="$(src/pcimem "$resource" "$off" w 2>>"$FULL")" || return 1
+	echo "$out" >> "$FULL"
+	echo "$out" | awk -F': ' '/^0x[0-9A-Fa-f]+: 0x[0-9A-Fa-f]+$/ {print $2}' | tail -1
+}
 
 requires() {
 	_nvme_requires
-	_have_fio
+	_have_program setpci
+	if [[ ! -x src/pcimem ]]; then
+		SKIP_REASONS+=("src/pcimem not built; run 'make' in the blktests root")
+		return 1
+	fi
+	if [[ "$(uname -m)" != "x86_64" ]]; then
+		SKIP_REASONS+=("test assumes x86 root-complex all-ones-on-UR behavior")
+		return 1
+	fi
 }
 
 device_requires() {
 	_require_test_dev_is_nvme_pci
-	# fio does not understand extended-LBA / separate-buffer metadata
-	# layouts without per-IO metadata options; skip metadata namespaces
-	# instead of trying to special-case them.
-	_test_dev_has_no_metadata
-}
-
-# Run one round of: fio bg + admin burst + reset + wait for the
-# block device to come back.  Returns 0 on success, 1 on failure;
-# failure reasons are printed to stdout (so they end up in the
-# blktests .full log and trigger an .out diff).
-_068_run_one() {
-	local sysfs=$1 nvmedev=$2
-	local m i p fio_pid fio_rc
-	local -a id_pids=()
-
-	_run_fio_rand_io --filename="$TEST_DEV" --rw=randrw \
-		--time_based --runtime=30 \
-		--group_reporting &> /dev/null &
-	fio_pid=$!
-
-	sleep 20
-
-	for (( i = 0; i < NDT_ID_BURST; i++ )); do
-		nvme id-ctrl "$TEST_DEV" > /dev/null 2>&1 &
-		id_pids+=($!)
-	done
-
-	sleep 1
-
-	echo 1 > "${sysfs}/${nvmedev}/reset_controller"
-
-	for p in "${id_pids[@]}"; do
-		wait "$p" 2>/dev/null || true
-	done
-
-	wait "$fio_pid"
-	fio_rc=$?
-
-	for (( m = 0; m < 10; m++ )); do
-		[[ -b "$TEST_DEV" ]] && break
-		sleep 0.5
-	done
-	if (( m >= 10 )); then
-		echo "$TEST_DEV did not come back after reset"
-		return 1
-	fi
-	udevadm settle
-
-	if (( fio_rc != 0 )); then
-		echo "fio failed: rc=${fio_rc}"
-		return 1
-	fi
-	return 0
 }
 
 test_device() {
 	echo "Running ${TEST_NAME}"
 
-	local pdev sysfs nvmedev ix iter_st overall_rc=0
-	local _gate
+	local pdev resource
+	local base off restored i rc=0
 
-	pdev=$(_get_pci_dev_from_blkdev)
-	sysfs="/sys/bus/pci/devices/${pdev}/nvme"
-	if [[ ! -d "$sysfs" ]]; then
-		echo "$sysfs missing"
-		return 1
-	fi
-	# Exactly one controller per PCI function; pick whichever it is.
-	nvmedev=$(ls "$sysfs" | head -1)
-	if [[ -z "$nvmedev" ]]; then
-		echo "no nvme controller under $sysfs"
+	pdev="$(_get_pci_dev_from_blkdev)"
+	resource="/sys/bus/pci/devices/${pdev}/resource0"
+	if [[ ! -r "$resource" ]]; then
+		echo "BAR0 resource not available: ${resource}"
 		return 1
 	fi
 
-	for (( ix = 1; ix <= NDT_INNER_ITER; ix++ )); do
-		# Multi-iter mode: hand control back to the host so it can
-		# re-apply cq-delay on the freshly recreated admin SQ before
-		# we kick the next round.  Single-iter mode keeps the test
-		# behaviour bit-for-bit compatible with v1.
-		if (( NDT_INNER_ITER > 1 )); then
-			echo "=== NDT_INNER_ITER iter=$ix phase='ready' ===" \
-				> /dev/ttyS0
-			# 10-minute timeout so a host-side bug doesn't hang
-			# blktests forever; any line unblocks.
-			read -r -t 600 _gate < /dev/ttyS1 || true
-		fi
+	# Detach the nvme driver so it does not race the Memory Space Enable toggle.
+	echo -n "${pdev}" > /sys/bus/pci/drivers/nvme/unbind
 
-		if _068_run_one "$sysfs" "$nvmedev"; then
-			iter_st=done
-		else
-			iter_st=fail
-			overall_rc=1
-		fi
+	# 1. Baseline: with Memory Space Enable set, VS must read a real value.
+	base="$(_pcimem_read32 "$resource" "$NVME_REG_VS")"
+	echo "VS with MSE on:   ${base:-<none>}" >> "$FULL"
 
-		if (( NDT_INNER_ITER > 1 )); then
-			echo "=== NDT_INNER_ITER iter=$ix phase='${iter_st}' ===" \
-				> /dev/ttyS0
-		fi
+	# 2. Clear Memory Space Enable (masked read-modify-write of bit 1 only).
+	setpci -s "${pdev}" COMMAND.w=0:2
+	off="$(_pcimem_read32 "$resource" "$NVME_REG_VS")"
+	echo "VS with MSE off:  ${off:-<none>}" >> "$FULL"
+
+	# 3. Restore Memory Space Enable unconditionally, then read back.
+	setpci -s "${pdev}" COMMAND.w=2:2
+	restored="$(_pcimem_read32 "$resource" "$NVME_REG_VS")"
+	echo "VS after restore: ${restored:-<none>}" >> "$FULL"
+
+	# Re-attach the nvme driver and wait for the namespace to reappear.
+	echo -n "${pdev}" > /sys/bus/pci/drivers/nvme/bind 2>/dev/null
+	for ((i = 0; i < 20; i++)); do
+		[[ -b ${TEST_DEV} ]] && break
+		sleep .5
 	done
 
-	if (( overall_rc == 0 )); then
+	# Evaluate. Comparisons are case-folded since pcimem prints uppercase hex.
+	if [[ -z "$base" || "${base^^}" == "0XFFFFFFFF" ]]; then
+		echo "Test failed: invalid baseline VS read (${base:-<none>})"
+		rc=1
+	elif [[ "${off^^}" != "0XFFFFFFFF" ]]; then
+		echo "Test failed: expected 0xFFFFFFFF with MSE off, got ${off:-<none>}"
+		rc=1
+	elif [[ "${restored^^}" != "${base^^}" ]]; then
+		echo "Test failed: VS not restored (${restored:-<none>} != ${base})"
+		rc=1
+	elif [[ ! -b ${TEST_DEV} ]]; then
+		echo "Test failed: ${TEST_DEV} did not come back after rebind"
+		rc=1
+	fi
+
+	if [[ $rc -eq 0 ]]; then
 		echo "Test complete"
 	fi
-	return "$overall_rc"
+	return $rc
 }

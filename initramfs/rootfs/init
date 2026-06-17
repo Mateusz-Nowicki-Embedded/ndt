@@ -39,8 +39,6 @@ udevadm trigger --action=add --type=subsystems
 udevadm trigger --action=add --type=devices
 udevadm settle --timeout=10
 echo "[init] udev ready"
-bash
-exit 0
 
 # Host nvme driver is needed to bind to our software endpoint (nvmet-pci-sw
 # exposes a fake NVMe device on bus 0xfe).  Loaded here so it's ready when
@@ -54,108 +52,17 @@ modprobe nvmet
 mkdir -p /sys/kernel/config
 mount -t configfs configfs /sys/kernel/config
 
-mkdir -p /sys/kernel/config/nvmet/subsystems/nqn.test
-echo 1 >/sys/kernel/config/nvmet/subsystems/nqn.test/attr_allow_any_host
-mkdir /sys/kernel/config/nvmet/subsystems/nqn.test/namespaces/1
-echo /dev/nullb0 > \
-    /sys/kernel/config/nvmet/subsystems/nqn.test/namespaces/1/device_path
-echo 1 >/sys/kernel/config/nvmet/subsystems/nqn.test/namespaces/1/enable
+#mkdir -p /sys/kernel/config/nvmet/subsystems/vnvme-ss
+#echo 1 > /sys/kernel/config/nvmet/subsystems/vnvme-ss/attr_allow_any_host
+#mkdir /sys/kernel/config/nvmet/subsystems/vnvme-ss/namespaces/1
+#echo /dev/nullb0 > /sys/kernel/config/nvmet/subsystems/vnvme-ss/namespaces/1/device_path
+#echo 1 > /sys/kernel/config/nvmet/subsystems/vnvme-ss/namespaces/1/enable
 
-modprobe nvmet-pci-sw
-mkdir /sys/kernel/config/nvmet/ports/1
-echo pci >/sys/kernel/config/nvmet/ports/1/addr_trtype
-ln -s /sys/kernel/config/nvmet/subsystems/nqn.test \
-    /sys/kernel/config/nvmet/ports/1/subsystems/nqn.test
+#exec /nvmve_load.sh
 
-# Wait for the host nvme driver to bind the endpoint and publish the
-# block device — tests assume /dev/nvme0n1 exists.  The endpoint is the
-# only NVMe controller present, so it always gets nvme0.
-for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    [ -e /dev/nvme0n1 ] && break
-    sleep 0.5
-done
-[ -e /dev/nvme0n1 ] || echo "[init] WARNING: /dev/nvme0n1 not present after 10s"
+#mkdir /sys/kernel/config/nvmet/ports/1
+#echo -n pci > /sys/kernel/config/nvmet/ports/1/addr_trtype
+#ln -s /sys/kernel/config/nvmet/subsystems/vnvme-ss /sys/kernel/config/nvmet/ports/1/subsystems/vnvme-ss
 
-udevadm settle --timeout=10
-
-# Burn the one-shot "capability attribute has been deprecated" warning so it
-# does not race blktest dmesg scans (nvme/039 etc.).
-cat /sys/block/*/capability >/dev/null 2>&1 || true
-
-ndt_emit() { echo "=== $* ==="; }
-
-ndt_die() {
-    ndt_emit "NDT_RESULT error='$1'"
-    poweroff -f
-    exit 0
-}
-
-# Parse ndt.test=NNN and ndt.iter=K from /proc/cmdline.
-ndt_test=""
-ndt_iter=""
-for tok in $(cat /proc/cmdline); do
-    case "$tok" in
-    ndt.test=*) ndt_test=${tok#ndt.test=} ;;
-    ndt.iter=*) ndt_iter=${tok#ndt.iter=} ;;
-    esac
-done
-
-# No ndt.test on cmdline -> interactive QEMU session.  Drop the user into
-# a login-ish bash on the console; /dev/nvme0n1 is already up so they can
-# poke at the device, run nvme-cli, etc.  Type `poweroff -f` to exit.
-if [[ -z "$ndt_test" ]]; then
-    echo
-    echo "[init] no ndt.test on cmdline — interactive session"
-    echo "[init] /dev/nvme0n1 is live; 'poweroff -f' to exit"
-    echo
-    exec /bin/bash
-fi
-
-[[ -z "$ndt_iter" ]] && ndt_die "missing-or-bad-cmdline"
-[[ "$ndt_test" =~ ^[0-9]+$ ]] || ndt_die "missing-or-bad-cmdline"
-[[ "$ndt_iter" =~ ^[0-9]+$ && "$ndt_iter" -gt 0 ]] || ndt_die "missing-or-bad-cmdline"
-
-ndt_blktest="nvme/$ndt_test"
-
-if [[ ! -f "/opt/blktests/tests/$ndt_blktest" ]]; then
-    ndt_die "test-not-found"
-fi
-
-pass=0
-fail=0
-skip=0
-
-for ((i = 1; i <= ndt_iter; i++)); do
-    echo "[init] iter $i/$ndt_iter: $ndt_blktest"
-    (cd /opt/blktests && ./check "$ndt_blktest") || true
-
-    # Aggregate across all namespace result dirs (any fail wins, else any
-    # pass, else skip).  Matches the old ndt_run semantics.
-    any_pass=0
-    any_fail=0
-    any_skip=0
-    for d in /opt/blktests/results/*/; do
-        f="${d}${ndt_blktest}"
-        [[ -f "$f" ]] || continue
-        s=$(sed -n 's/^status\t//p' "$f" | head -1)
-        case "$s" in
-        pass) any_pass=1 ;;
-        "not run" | skipped | "") any_skip=1 ;;
-        *) any_fail=1 ;;
-        esac
-    done
-
-    if ((any_fail)); then
-        fail=$((fail + 1))
-    elif ((any_pass)); then
-        pass=$((pass + 1))
-    else
-        skip=$((skip + 1))
-    fi
-
-    # Wipe results so next iter doesn't fold previous status in.
-    rm -rf /opt/blktests/results/*
-done
-
-ndt_emit "NDT_RESULT pass=$pass fail=$fail skip=$skip iter=$ndt_iter test=$ndt_blktest"
+exec /bin/bash
 poweroff -f

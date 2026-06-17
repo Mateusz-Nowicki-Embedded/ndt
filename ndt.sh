@@ -66,7 +66,7 @@ if (( kunit_mode )); then
 elif [[ -z "$test_num" ]]; then
     # No test requested -> hand the user a plain QEMU session.  Init sees
     # the missing ndt.test on cmdline and execs /bin/bash on the console.
-    APPEND="console=ttyS0 panic=-1 memmap=64K\$0x100000000 nvme.poll_queues=4 nvme_core.multipath=0" \
+    APPEND="console=ttyS0 panic=-1 memmap=64K\$0x100000000" \
     NDT_INTERACTIVE=1 \
         exec "$NDT/scripts/run-qemu.sh"
 else
@@ -119,7 +119,7 @@ if (( kunit_mode )); then
 else
     cmd_test="ndt.test=$nn ndt.iter=$iters"
 fi
-APPEND="console=ttyS0 panic=-1 memmap=64K\$0x100000000 nvme.poll_queues=4 nvme_core.multipath=0 $cmd_test" \
+APPEND="console=ttyS0 panic=-1 memmap=64K\$0x100000000  $cmd_test" \
     "$NDT/scripts/run-qemu.sh" > "$qlog" 2>&1 &
 qemu_pid=$!
 

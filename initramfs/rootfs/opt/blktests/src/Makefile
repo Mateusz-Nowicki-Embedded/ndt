@@ -8,10 +8,6 @@ HAVE_C_MACRO = $(shell if echo "$(H)include <$(1)>" |	\
 		$(CC) $(CFLAGS) -E - 2>&1 /dev/null | grep $(2) > /dev/null 2>&1; \
 		then echo 1;else echo 0; fi)
 
-# Out-of-tree build: with O=<dir>, write binaries under <dir>/ instead of
-# next to the sources.  Without O, behavior is unchanged.
-BIN := $(if $(O),$(O)/,)
-
 C_TARGETS := \
 	dio-offsets \
 	loblksize \
@@ -22,6 +18,7 @@ C_TARGETS := \
 	ioctl-lbmd-query \
 	nbdsetsize \
 	openclose \
+	pcimem \
 	sg/dxfer-from-dev \
 	zbdioctl
 
@@ -61,29 +58,25 @@ URING_FLAGS :=  -D_GNU_SOURCE
 URING_LIBS := -lpthread -luring
 LDFLAGS ?=
 
-all: $(addprefix $(BIN),$(TARGETS))
+all: $(TARGETS)
 
 clean:
-	rm -f $(addprefix $(BIN),$(TARGETS))
+	rm -f $(TARGETS)
 
-install: $(addprefix $(BIN),$(TARGETS))
+install: $(TARGETS)
 	install -m755 -d $(dest)
-	install $(addprefix $(BIN),$(TARGETS)) $(dest)
+	install $(TARGETS) $(dest)
 
-$(addprefix $(BIN),$(C_TARGETS)): $(BIN)%: %.c
-	@mkdir -p $(dir $@)
+$(C_TARGETS): %: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
-$(addprefix $(BIN),$(CXX_TARGETS)): $(BIN)%: %.cpp
-	@mkdir -p $(dir $@)
+$(CXX_TARGETS): %: %.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $^
 
-$(addprefix $(BIN),$(SYZKALLER_TARGETS)): $(BIN)%: %.c
-	@mkdir -p $(dir $@)
+$(SYZKALLER_TARGETS): %: %.c
 	$(CC) $(CFLAGS) -Wno-unused-but-set-variable $(LDFLAGS) -o $@ $^
 
-$(addprefix $(BIN),$(C_URING_TARGETS)): $(BIN)%: %.c
-	@mkdir -p $(dir $@)
+$(C_URING_TARGETS): %: %.c
 	$(CC) $(CFLAGS) $(LDFLAGS) $(URING_FLAGS) -o $@ $^ $(URING_LIBS)
 
 .PHONY: all clean install

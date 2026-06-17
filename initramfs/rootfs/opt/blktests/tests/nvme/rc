@@ -72,18 +72,11 @@ group_device_requires() {
 }
 
 _require_test_dev_is_nvme_pci() {
-	# Accept a canonical PCI tree (.../devices/pci<DOMAIN>:.../) as well as
-	# a platform-rooted PCI tree (.../devices/platform/<name>/pci<DOMAIN>:.../).
-	# The latter is how the nvmet-pci-sw software endpoint hangs its
-	# virtual bus off a platform device.
-	local resolved
-	resolved=$(readlink -f "$TEST_DEV_SYSFS/device")
-	if [[ "$resolved" =~ devices/pci[0-9] ]] \
-	   || [[ "$resolved" =~ devices/platform/.*/pci[0-9] ]]; then
-		return 0
+	if [[ ! "$(readlink -f "$TEST_DEV_SYSFS/device")" =~ devices/pci ]]; then
+		SKIP_REASONS+=("$TEST_DEV is not a PCI NVMe device")
+		return 1
 	fi
-	SKIP_REASONS+=("$TEST_DEV is not a PCI NVMe device")
-	return 1
+	return 0
 }
 
 _require_test_dev_is_not_nvme_multipath() {

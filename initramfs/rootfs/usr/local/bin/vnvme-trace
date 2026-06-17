@@ -1,0 +1,182 @@
+#!/bin/sh
+# vnvme-trace -- capture ftrace function_graph for the out-of-tree vnvme
+# module and dump it to the console for serial exfiltration (NDT has no
+# net/9p/shared-fs; ttyS0 -> console.log is the only guest->host channel).
+#
+# The host extracts the trace from console.log with sed between the markers
+#   === VNVME_FG_BEGIN ===
+#   === VNVME_FG_END ===
+#
+# Modes (mutually exclusive, checked in this order): SLEEPS > PERIOD > GRAPH_FN
+# > default. All but the default need the matching symbol to be hookable, i.e.
+# present in $TR/available_filter_functions (static-inlined funcs are NOT).
+#
+# Env knobs:
+#   VNVME_TRACE_MOD  module name for the default :mod: filter          [vnvme]
+#   DEPTH            max_graph_depth (call nesting captured)           [8]
+#   THRESH           tracing_thresh us; 0=all, >0=only slower calls    [0]
+#   GRAPH_FN         root the graph here, trace ALL callees incl.      []
+#                    non-module code (e.g. host nvme ISR under
+#                    generic_handle_irq_safe). Drops the :mod: filter.
+#                      GRAPH_FN=endpoint_raise_msix vnvme-trace run fio ...
+#   PERIOD           anchor on ONE per-iteration function; the         []
+#                    timestamp delta between consecutive calls = the
+#                    full poll-loop period (housekeeping + any sleep).
+#                    Needs funcgraph-abstime (auto-enabled).
+#                      PERIOD=sm_process vnvme-trace run fio ...
+#   SLEEPS           =1: trace every usleep_range so you can see if/when    []
+#                    the poll loop sleeps. usleep_range() is static-inline;
+#                    the hookable symbol is usleep_range_state, matched by
+#                    the 'usleep_range*' glob. Matches ALL sleepers, not
+#                    just vnvme. Needs funcgraph-abstime (auto-enabled).
+#                      SLEEPS=1 vnvme-trace run fio ...
+#
+# Subcommands:
+#   start            configure + enable tracing
+#   stop             disable, dump buffer between markers, reset tracer
+#   run CMD...       start -> run CMD -> stop+dump (main mode: trace one workload)
+#   -h | (none)      usage
+
+MOD=${VNVME_TRACE_MOD:-vnvme}
+DEPTH=${DEPTH:-8}
+THRESH=${THRESH:-0}
+DUMP_COPY=/tmp/vnvme-fg.txt
+
+# 1. Locate tracefs.
+if [ -d /sys/kernel/tracing/. ] && [ -f /sys/kernel/tracing/trace ]; then
+    TR=/sys/kernel/tracing
+elif [ -d /sys/kernel/debug/tracing/. ] && [ -f /sys/kernel/debug/tracing/trace ]; then
+    TR=/sys/kernel/debug/tracing
+else
+    echo "vnvme-trace: tracefs not found (tried /sys/kernel/tracing and /sys/kernel/debug/tracing)" >&2
+    exit 1
+fi
+
+usage() {
+    cat <<EOF
+usage: vnvme-trace {start|stop|run CMD...|-h}
+
+  start         configure function_graph and start tracing
+  stop          stop tracing, dump buffer to console, reset tracer
+  run CMD...    start, run CMD, then stop+dump (trace one workload)
+
+modes: VNVME_TRACE_MOD=$MOD  DEPTH=$DEPTH  THRESH=${THRESH}us
+       GRAPH_FN=$GRAPH_FN  PERIOD=$PERIOD  SLEEPS=$SLEEPS
+examples:
+  vnvme-trace run fio --name=p --filename=/dev/nvme0n1 --rw=read --bs=64k --size=4m --direct=1
+  GRAPH_FN=endpoint_raise_msix vnvme-trace run fio ...   # host ISR inline in the raise
+  PERIOD=sm_process            vnvme-trace run fio ...   # poll-loop period (abstime deltas)
+  SLEEPS=1                     vnvme-trace run fio ...   # does the poll loop sleep?
+EOF
+}
+
+# 2. Module precheck: refuse to trace if the module is not loaded, otherwise
+#    the buffer comes back empty and the run looks broken for no reason.
+check_mod() {
+    if grep -q "^${MOD} " /proc/modules; then
+        return 0
+    fi
+    echo "vnvme-trace: module '$MOD' not loaded" >&2
+    echo "vnvme-trace: currently loaded modules:" >&2
+    awk '{print $1}' /proc/modules >&2
+    exit 1
+}
+
+# 4. ftrace setup. set_ftrace_filter and current_tracer are critical; the rest
+#    are tolerant (older/stripped kernels may lack a given knob).
+do_start() {
+    echo 0 > "$TR/tracing_on"
+    echo function_graph > "$TR/current_tracer" || {
+        echo "vnvme-trace: cannot set function_graph tracer" >&2; exit 1; }
+
+    abstime=0
+    if [ -n "$SLEEPS" ]; then
+        # Every usleep_range, so you can see if/when the poll loop sleeps.
+        [ -f "$TR/set_graph_function" ] && : > "$TR/set_graph_function"
+        echo 'usleep_range*' > "$TR/set_ftrace_filter" || {
+            echo "vnvme-trace: no 'usleep_range*' hookable symbol" >&2
+            echo "vnvme-trace: check: grep usleep_range $TR/available_filter_functions" >&2
+            exit 1; }
+        abstime=1
+        scope="sleeps:usleep_range*"
+    elif [ -n "$PERIOD" ]; then
+        # One per-iteration anchor; abstime deltas between its calls = period.
+        [ -f "$TR/set_graph_function" ] && : > "$TR/set_graph_function"
+        echo "$PERIOD" > "$TR/set_ftrace_filter" || {
+            echo "vnvme-trace: '$PERIOD' not hookable (inlined?); check $TR/available_filter_functions" >&2
+            exit 1; }
+        abstime=1
+        scope="period:$PERIOD"
+    elif [ -n "$GRAPH_FN" ]; then
+        # Graph-root: start the graph at GRAPH_FN, trace ALL callees (incl.
+        # non-module code). set_ftrace_filter MUST be empty here.
+        : > "$TR/set_ftrace_filter"
+        echo "$GRAPH_FN" > "$TR/set_graph_function" || {
+            echo "vnvme-trace: cannot set graph root '$GRAPH_FN' (inlined?); check $TR/available_filter_functions" >&2
+            exit 1; }
+        scope="graph-root:$GRAPH_FN"
+    else
+        # Default: only the module's own functions.
+        [ -f "$TR/set_graph_function" ] && : > "$TR/set_graph_function"
+        echo ":mod:$MOD" > "$TR/set_ftrace_filter" || {
+            echo "vnvme-trace: cannot set :mod:$MOD filter" >&2; exit 1; }
+        scope=":mod:$MOD"
+    fi
+
+    # Absolute timestamps: needed to read PERIOD/SLEEPS deltas; off otherwise.
+    [ -f "$TR/options/funcgraph-abstime" ] && echo "$abstime" > "$TR/options/funcgraph-abstime"
+
+    [ -f "$TR/max_graph_depth" ] && echo "$DEPTH"  > "$TR/max_graph_depth"
+    [ -f "$TR/tracing_thresh"  ] && echo "$THRESH" > "$TR/tracing_thresh"
+    : > "$TR/trace"
+    echo 1 > "$TR/tracing_on"
+    echo "vnvme-trace: collecting function_graph ($scope, depth=$DEPTH thresh=${THRESH}us abstime=$abstime)"
+}
+
+# 5/6. Stop, dump between markers (and to a tmpfs copy), then reset tracer so
+#      the next run / other tooling sees a clean ftrace state.
+do_stop() {
+    echo 0 > "$TR/tracing_on"
+    echo "=== VNVME_FG_BEGIN ==="
+    cat "$TR/trace" | tee "$DUMP_COPY"
+    echo "=== VNVME_FG_END ==="
+
+    # reset (idempotent): plain tracer, empty filter/graph-root, no threshold.
+    echo nop > "$TR/current_tracer"
+    : > "$TR/set_ftrace_filter"
+    [ -f "$TR/set_graph_function" ] && : > "$TR/set_graph_function"
+    [ -f "$TR/options/funcgraph-abstime" ] && echo 0 > "$TR/options/funcgraph-abstime"
+    [ -f "$TR/tracing_thresh" ] && echo 0 > "$TR/tracing_thresh"
+    # leave max_graph_depth at 0 = unlimited, ftrace's own default.
+    [ -f "$TR/max_graph_depth" ] && echo 0 > "$TR/max_graph_depth"
+}
+
+cmd=$1
+case "$cmd" in
+    start)
+        check_mod
+        do_start
+        ;;
+    stop)
+        check_mod
+        do_stop
+        ;;
+    run)
+        shift
+        [ $# -ge 1 ] || { echo "vnvme-trace: run needs a command" >&2; usage >&2; exit 1; }
+        check_mod
+        do_start
+        "$@"
+        rc=$?
+        do_stop
+        exit $rc
+        ;;
+    -h|--help|"")
+        usage
+        ;;
+    *)
+        echo "vnvme-trace: unknown subcommand '$cmd'" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

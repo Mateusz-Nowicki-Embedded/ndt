@@ -51,7 +51,7 @@ NVMET_KO=$KBUILD/drivers/nvme/target/nvmet.ko
 if [[ -f "$NVMET_KO" ]]; then
     mkdir -p "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/target"
     cp "$NVMET_KO" "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/target/"
-    for opt in nvme-loop.ko nvmet-tcp.ko nvmet-rdma.ko nvmet-fc.ko; do
+    for opt in nvme-loop.ko nvmet-tcp.ko nvmet-rdma.ko nvmet-fc.ko nvmet-pci-vepc.ko nvmet-pci-epf.ko; do
         [[ -f "$KBUILD/drivers/nvme/target/$opt" ]] &&
             cp "$KBUILD/drivers/nvme/target/$opt" \
                 "$ROOTFS/lib/modules/$KVER/kernel/drivers/nvme/target/"
@@ -77,12 +77,12 @@ for f in modules.order modules.builtin modules.builtin.modinfo; do
 done
 
 # Out-of-tree nvme module — virtual NVMe PCIe endpoint.
-VNVME_SRC=$NDT/third_party/vnvme
-VNVME_KO=$VNVME_SRC/vnvme.ko
-if [[ -f "$VNVME_KO" ]]; then
-    mkdir -p "$ROOTFS/lib/modules/$KVER/extra"
-    cp "$VNVME_KO" "$ROOTFS/lib/modules/$KVER/extra/"
-    echo "[build-initramfs] copy out-of-tree: vnvme.ko"
+VNVME=$NDT/third_party/vnvme
+VNVME=$VNVME/vnvme.ko
+if [[ -f "$VNVME" ]]; then
+    mkdir -p "$ROOTFS/lib/modules/extra"
+    cp "$VNVME" "$ROOTFS/lib/modules/extra/"
+    echo "[build-initramfs] copy out-of-tree: vepf.ko"
 
     # KUnit test modules — built on demand (make NPS_KUNIT=y) and bundled
     # next to the main module so `ndt.kunit=1` in init can insmod them.
@@ -101,7 +101,7 @@ if [[ -f "$VNVME_KO" ]]; then
     #   echo "[build-initramfs] note: no NPS_KUNIT target in module source, KUnit skipped" >&2
     #fi
 else
-    echo "[build-initramfs] warn: $VNVME_KO not built, skipping" >&2
+    echo "[build-initramfs] warn: $VNVME not built, skipping" >&2
 fi
 
 depmod -b "$ROOTFS" "$KVER"
