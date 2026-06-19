@@ -1,12 +1,15 @@
 [submodule "third_party/qemu-nvme"]
 	path = third_party/qemu-nvme
 	url = git@github.com:Mateusz-Nowicki-Embedded/qemu-nvme.git
+	shallow = true
 [submodule "third_party/nvme-cli-fork"]
 	path = third_party/nvme-cli-fork
 	url = git@github.com:Mateusz-Nowicki-Embedded/nvme-cli-fork.git
+	shallow = true
 [submodule "third_party/blktests-fork"]
 	path = third_party/blktests-fork
 	url = git@github.com:Mateusz-Nowicki-Embedded/blktests-fork.git
+	shallow = true
 [submodule "third_party/linux-fork"]
 	path = third_party/linux-fork
 	url = git@github.com:Mateusz-Nowicki-Embedded/linux-fork.git
@@ -18,6 +21,8 @@
 [submodule "third_party/nvmet-pci-sw"]
 	path = third_party/nvmet-pci-sw
 	url = git@github.com:Mateusz-Nowicki-Embedded/nvmet-pci-sw.git
+	shallow = true
 [submodule "third_party/vnvme"]
 	path = third_party/vnvme
 	url = git@github.com:Mateusz-Nowicki-Embedded/vnvme.git
+	shallow = true
