@@ -1,4 +1,8 @@
 ```
+./ndt.sh - starts NVMe driver tester interactiver session
+```
+```
+
 bash-5.3# ./vnvme_load.sh
 [    6.225162] nvmet: adding nsid 1 to subsystem vnvme-ss
 [    6.226957] vnvme: loading out-of-tree module taints kernel.
