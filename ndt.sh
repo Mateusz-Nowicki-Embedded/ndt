@@ -72,7 +72,9 @@ fi
 
 # Use the system qemu by default; override with QEMU_BIN=/path/to/qemu-... .
 QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
-BZIMAGE="$NDT/build/linux/arch/x86/boot/bzImage"
+# Both artifacts are checked into initramfs/ so ndt.sh can run from a fresh
+# clone without a build tree.  build-kernel.sh refreshes bzImage there.
+BZIMAGE="$NDT/initramfs/bzImage"
 INITRAMFS="$NDT/initramfs/initramfs.cpio.gz"
 
 # The one and only base kernel cmdline.  memmap=64K$0x100000000 carves 64 KiB

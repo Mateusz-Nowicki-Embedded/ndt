@@ -138,6 +138,14 @@ TEST_DEVS=(/dev/nvme0n1)
 NORMAL_USER=nobody
 EOF
 
+# 3b. Mount points. git does not track empty directories, so the dirs the
+# guest init mounts onto (/proc, /sys, /dev, /tmp, /run) vanish from a fresh
+# checkout.  Recreate them here so the cpio always carries them.
+echo "[build-initramfs] create mount points"
+for d in proc sys dev tmp run; do
+    mkdir -p "$ROOTFS/$d"
+done
+
 # 4. Repack
 echo "[build-initramfs] pack cpio.gz"
 (cd "$ROOTFS" &&

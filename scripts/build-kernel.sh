@@ -11,6 +11,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 NDT=$(cd "$HERE/.." && pwd)
 KSRC=$NDT/third_party/linux-fork
 BUILD=$NDT/build/linux
+BZIMAGE_DST=$NDT/initramfs/bzImage
 TARGETS="bzImage modules scripts_gdb"
 FLAVOR=${FLAVOR:-debug}
 
@@ -36,4 +37,9 @@ make -C "$KSRC" O="$BUILD" olddefconfig
 # shellcheck disable=SC2086
 make -C "$KSRC" O="$BUILD" -j"$(nproc)" $TARGETS
 
+# Publish bzImage into initramfs/ so ndt.sh can boot a checked-in kernel
+# without a build tree (see initramfs/initramfs.cpio.gz, shipped the same way).
+cp "$BUILD/arch/x86/boot/bzImage" "$BZIMAGE_DST"
+
 echo "[build-kernel] done: $BUILD/arch/x86/boot/bzImage"
+echo "[build-kernel] published: ${BZIMAGE_DST#$NDT/}"
