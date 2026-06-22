@@ -66,20 +66,17 @@ else
 fi
 
 # --- QEMU launch (folded in from the old scripts/run-qemu.sh) ---------------
-# No QEMU-emulated NVMe device — the test target is nvmet-pci-sw, which lives
+# No QEMU-emulated NVMe device — the test target is vnvme, which lives
 # entirely inside the guest kernel; null_blk backs its namespaces.  Q35 keeps
 # the PCIe root complex (the module's virtual bridge lives under bus 0xfe).
 
-QEMU_BIN="$NDT/build/qemu-host/qemu-system-x86_64"
-if [[ ! -x "$QEMU_BIN" ]]; then
-    echo "[ndt] $QEMU_BIN not found, falling back to system qemu-system-x86_64" >&2
-    QEMU_BIN=qemu-system-x86_64
-fi
+# Use the system qemu by default; override with QEMU_BIN=/path/to/qemu-... .
+QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
 BZIMAGE="$NDT/build/linux/arch/x86/boot/bzImage"
 INITRAMFS="$NDT/initramfs/initramfs.cpio.gz"
 
 # The one and only base kernel cmdline.  memmap=64K$0x100000000 carves 64 KiB
-# out of high RAM to back the module's BAR0 (modules/nvmet-pci-sw/bar.c; the
+# out of high RAM to back the module's BAR0 (vnvme; the
 # literal '$' is escaped so the shell doesn't expand $0).  Callers append only
 # the test selector (ndt.test=/ndt.iter=/ndt.kunit=).  Full override: APPEND=.
 base_cmdline="console=ttyS0 panic=-1 memmap=64K\$0x100000000 nvme_core.multipath=0"
@@ -97,6 +94,12 @@ assert_artifacts() {
 # Cheap sanity checks so failures surface here, not deep inside qemu.log.
 # $1 = also require socat (1 for test mode, 0 for interactive).
 preflight() {
+    if ! command -v "$QEMU_BIN" >/dev/null 2>&1 && [[ ! -x "$QEMU_BIN" ]]; then
+        echo "[ndt] qemu not found: $QEMU_BIN" >&2
+        echo "[ndt] hint: install qemu-system-x86 (apt install qemu-system-x86 / emerge app-emulation/qemu)," >&2
+        echo "[ndt]       or point QEMU_BIN at a custom build." >&2
+        exit 2
+    fi
     if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
         echo "[ndt] /dev/kvm not accessible — KVM acceleration unavailable." >&2
         echo "[ndt] hint: add yourself to the 'kvm' group (usermod -aG kvm \$USER), then re-login." >&2
