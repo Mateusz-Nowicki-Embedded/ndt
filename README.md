@@ -1,8 +1,8 @@
 ```
 ./ndt.sh - starts NVMe driver tester interactiver session
 ```
-```
 
+```
 bash-5.3# ./vnvme_load.sh
 [    6.225162] nvmet: adding nsid 1 to subsystem vnvme-ss
 [    6.226957] vnvme: loading out-of-tree module taints kernel.
@@ -33,6 +33,15 @@ bash-5.3# ./vnvme_load.sh
 [    6.234722] pcieport 12345:00:00.0: pciehp: Slot #1 AttnBtn- PwrCtrl+ MRL- AttnInd+ PwrInd+ HotPlug+ Surprise- Interlock- NoCompl+ IbPresDis- LLActRep+
 [    6.236460] [target]: registered nvmet PCI transport
 [    6.238224] [target]: nvmet add_port portid=1
+
+bash-5.3# lspci
+0000:00:00.0 Host bridge: Intel Corporation 82G33/G31/P35/P31 Express DRAM Controller
+0000:00:01.0 VGA compatible controller: Device 1234:1111 (rev 02)
+0000:00:02.0 Ethernet controller: Intel Corporation 82574L Gigabit Network Connection
+0000:00:1f.0 ISA bridge: Intel Corporation 82801IB (ICH9) LPC Interface Controller (rev 02)
+0000:00:1f.2 SATA controller: Intel Corporation 82801IR/IO/IH (ICH9R/DO/DH) 6 port SATA Controller [AHCI mode] (rev 02)
+0000:00:1f.3 SMBus: Intel Corporation 82801I (ICH9 Family) SMBus Controller (rev 02)
+12345:00:00.0 PCI bridge: Red Hat, Inc. Device 10f0 (rev 01)
 ```
 
 
@@ -109,6 +118,17 @@ bash-5.3# [    9.062977] [SM]: active event updated: [NO-OP] -> [POWER_ON]
 [    9.086350] [target]: nvmet create_cq cqid=16 depth=1024 vector=16 db=0x1084
 [    9.086686] [target]: nvmet create_sq sqid=16 cqid=16 depth=1024 db=0x1080
 [    9.087000] nvme nvme0: 16/0/0 default/read/poll queues
+
+bash-5.3# lspci
+0000:00:00.0 Host bridge: Intel Corporation 82G33/G31/P35/P31 Express DRAM Controller
+0000:00:01.0 VGA compatible controller: Device 1234:1111 (rev 02)
+0000:00:02.0 Ethernet controller: Intel Corporation 82574L Gigabit Network Connection
+0000:00:1f.0 ISA bridge: Intel Corporation 82801IB (ICH9) LPC Interface Controller (rev 02)
+0000:00:1f.2 SATA controller: Intel Corporation 82801IR/IO/IH (ICH9R/DO/DH) 6 port SATA Controller [AHCI mode] (rev 02)
+0000:00:1f.3 SMBus: Intel Corporation 82801I (ICH9 Family) SMBus Controller (rev 02)
+12345:00:00.0 PCI bridge: Red Hat, Inc. Device 10f0 (rev 01)
+12345:01:00.0 Non-Volatile memory controller: Red Hat, Inc. Device 10f1 (rev 01)
+
 ```
 
 
