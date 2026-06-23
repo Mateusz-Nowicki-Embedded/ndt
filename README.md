@@ -1,3 +1,18 @@
+------ early POC stage ------
+
+Goal: create framework for running blktests on qemu with virtual nvme drive.
+
+Virtual NVMe drive: it's based on kernel module not a qemu native nvme emulation
+
+vnvme: https://github.com/Mateusz-Nowicki-Embedded/vnvme
+
+
+
+Run test:
+./ndt.sh 069
+
+Manual interactive session:
+
 ```
 ./ndt.sh - starts NVMe driver tester interactiver session
 ```
