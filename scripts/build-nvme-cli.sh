@@ -21,8 +21,22 @@ fi
 echo "[build-nvme-cli] source: ${SRC#$NDT/}"
 echo "[build-nvme-cli] output: ${BUILD#$NDT/}"
 
+# JSON output (`nvme ... -o json`) needs json-c.  Force the meson feature to
+# 'enabled' so the build fails loudly if it is missing instead of silently
+# dropping JSON support (the upstream default is 'auto').
+if ! pkg-config --exists json-c; then
+    echo "[build-nvme-cli] error: json-c not found (required for JSON output)" >&2
+    echo "[build-nvme-cli] hint: install libjson-c-dev (apt) / dev-libs/json-c (emerge)" >&2
+    exit 1
+fi
+
+# -Djson-c=enabled must be applied even to an already-configured tree, hence
+# --reconfigure on the second run.
+meson_opts=( --buildtype=release -Djson-c=enabled )
 if [[ ! -f "$BUILD/build.ninja" ]]; then
-    meson setup "$BUILD" "$SRC" --buildtype=release
+    meson setup "$BUILD" "$SRC" "${meson_opts[@]}"
+else
+    meson setup --reconfigure "$BUILD" "$SRC" "${meson_opts[@]}"
 fi
 
 meson compile -C "$BUILD" -j "$(nproc)"

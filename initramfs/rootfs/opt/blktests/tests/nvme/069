@@ -1,0 +1,139 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026 Mateusz Nowicki
+#
+# Surprise-remove an NVMe controller while a reset is mid-drain, under I/O.
+#
+# This exercises the nvme-pci teardown race that the vnvme emulator was built
+# to reproduce deterministically:
+#
+#   1. drain_delay_ms is set to 5000, so when the host disables the controller
+#      the emulator parks in its DRAIN state for a full 5s before completing
+#      (see vnvme sm.c: SM_DRAIN honours cfg_drain_delay_ms()).
+#   2. fio drives heavy writes so there are commands in flight.
+#   3. reset_controller makes the nvme driver clear CC.EN; nvme_reset_work then
+#      blocks ~5s waiting for CSTS.RDY to drop while the emulator drains.
+#   4. One second into that window we request a hotremove. The emulator raises
+#      a surprise PCIe removal (SM_POWER_OFF) from under the in-progress reset.
+#
+# The kernel must tear the controller down cleanly: no hang, no oops/WARN (the
+# blktests harness checks dmesg automatically). Afterwards we hotplug the
+# device back and require it to re-enumerate, proving the full remove/re-add
+# cycle survives the race.
+#
+# Requires the vnvme emulator (the only NVMe backend exposing the configfs
+# knobs used here) loaded with TEST_DEV pointing at its namespace.
+
+. tests/nvme/rc
+
+DESCRIPTION="surprise hotremove during a controller reset drain under I/O"
+TIMEOUT=60
+
+# vnvme is a PCI NVMe function.
+nvme_trtype=pci
+
+VNVME_CFS="/sys/kernel/config/vnvme"
+
+requires() {
+	_nvme_requires
+	_have_fio
+	if [[ ! -d "$VNVME_CFS" ]]; then
+		SKIP_REASONS+=("vnvme emulator not loaded (no ${VNVME_CFS})")
+		return 1
+	fi
+}
+
+device_requires() {
+	_require_test_dev_is_nvme_pci
+	# Only the vnvme-backed controller honours the configfs drain/hotremove
+	# knobs; a real NVMe device would ignore them.
+	if [[ ! "$(readlink -f "${TEST_DEV_SYSFS}/device")" =~ /vnvme/ ]]; then
+		SKIP_REASONS+=("$TEST_DEV is not backed by the vnvme emulator")
+		return 1
+	fi
+}
+
+# Run the vnvme write workload from initramfs/rootfs/fio.sh, time-based so it
+# keeps issuing I/O across the whole reset/remove window.
+_vnvme_fio() {
+	fio --name=vnvme-write \
+	    --filename="${TEST_DEV}" \
+	    --ioengine=libaio --direct=1 \
+	    --rw=write --bs=4k --iodepth=32 --numjobs=8 \
+	    --time_based --runtime=20 \
+	    --group_reporting
+}
+
+test_device() {
+	echo "Running ${TEST_NAME}"
+
+	local nvmedev saved_delay fio_pid reset_pid i rc=0
+
+	nvmedev="$(basename "$(_nvme_get_ctrl_list)")"
+	if [[ -z "$nvmedev" || ! -w "/sys/class/nvme/${nvmedev}/reset_controller" ]]; then
+		echo "could not resolve nvme controller for ${TEST_DEV}"
+		return 1
+	fi
+
+	saved_delay="$(cat "${VNVME_CFS}/drain_delay_ms")"
+
+	# On interrupt, drop the long drain and try to bring the device back so we
+	# don't leave the system without TEST_DEV.
+	trap 'echo "$saved_delay" > "${VNVME_CFS}/drain_delay_ms" 2>/dev/null; \
+	      echo 1 > "${VNVME_CFS}/hotplug" 2>/dev/null; exit 1' INT TERM
+
+	# 1. Stretch the reset drain window to 5s.
+	echo 5000 > "${VNVME_CFS}/drain_delay_ms"
+
+	# 2. Background write workload; let it ramp so I/O is genuinely in flight.
+	_vnvme_fio >> "$FULL" 2>&1 &
+	fio_pid=$!
+	sleep 30
+
+	# 3. Kick a controller reset. It parks in the drain for ~5s, so background
+	#    it and step into that window. The reset write is expected to fail with
+	#    ENETRESET ("Network dropped connection on reset") once the surprise
+	#    removal lands mid-reset, so funnel its output into $FULL rather than
+	#    letting bash's echo error leak into the test's compared output.
+	echo "resetting ${nvmedev}" >> "$FULL"
+	{ echo 1 > "/sys/class/nvme/${nvmedev}/reset_controller"; } >> "$FULL" 2>&1 &
+	reset_pid=$!
+
+	# 4. Surprise-remove mid-reset.
+	sleep 1
+	echo "hotremove during reset" >> "$FULL"
+	echo 1 > "${VNVME_CFS}/hotremove"
+
+	# Device must go away.
+	for ((i = 0; i < 100; i++)); do
+		[[ -b ${TEST_DEV} ]] || break
+		sleep .1
+	done
+	if [[ -b ${TEST_DEV} ]]; then
+		echo "Test failed: ${TEST_DEV} still present after hotremove"
+		rc=1
+	fi
+
+	# Stop the workload and the (now-doomed) reset writer.
+	{ kill "$fio_pid" "$reset_pid"; wait; } &> /dev/null
+
+	# 5. Plug it back in and require re-enumeration.
+	echo 1 > "${VNVME_CFS}/hotplug"
+	for ((i = 0; i < 100; i++)); do
+		[[ -b ${TEST_DEV} ]] && break
+		sleep .1
+	done
+	udevadm settle
+	if [[ ! -b ${TEST_DEV} ]]; then
+		echo "Test failed: ${TEST_DEV} did not return after hotplug"
+		rc=1
+	fi
+
+	echo "$saved_delay" > "${VNVME_CFS}/drain_delay_ms"
+	trap - INT TERM
+
+	if [[ $rc -eq 0 ]]; then
+		echo "Test complete"
+	fi
+	return $rc
+}

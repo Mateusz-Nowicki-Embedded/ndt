@@ -2,14 +2,14 @@
 
 Goal: create framework for running blktests on qemu with virtual nvme drive.
 
-Virtual NVMe drive: it's based on kernel module not a qemu native nvme emulation
+Virtual NVMe drive: is based on kernel module not a qemu native nvme emulation
 
 vnvme: https://github.com/Mateusz-Nowicki-Embedded/vnvme
 
 
-
 Run test:
-./ndt.sh 069
+./ndt.sh 069 - it will execute blktest 069 and report the status
+./ndt.sh 069 --follow - same as above + showing all logs from qemu
 
 Manual interactive session:
 

@@ -1,0 +1,114 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0+
+# Copyright (C) 2026 Mateusz Nowicki
+#
+# Surprise-remove an NVMe controller while heavy I/O is in flight.
+#
+# Unlike nvme/069, there is no controller reset and no stretched drain here.
+# The controller is fully enabled and serving a steady fio write stream when the
+# vnvme emulator raises a surprise PCIe removal (SM_POWER_OFF) out from under it.
+# This exercises the plain hot-unplug-under-load teardown path in nvme-pci:
+# in-flight commands must be failed, the namespace/block device torn down and
+# all queues freed without a hang, oops or WARN.
+#
+# Sequence:
+#   1. fio drives heavy writes so there are commands genuinely in flight.
+#   2. A few seconds in, we request a surprise hotremove.
+#   3. The block device must disappear and the kernel must stay clean (the
+#      blktests harness checks dmesg automatically).
+#   4. We hotplug the device back and require it to re-enumerate, proving the
+#      remove/re-add cycle survives I/O in flight.
+#
+# Requires the vnvme emulator (the only NVMe backend exposing the configfs
+# hotremove/hotplug knobs used here) loaded with TEST_DEV pointing at its
+# namespace.
+
+. tests/nvme/rc
+
+DESCRIPTION="surprise hotremove of an NVMe controller under I/O"
+TIMEOUT=60
+
+# vnvme is a PCI NVMe function.
+nvme_trtype=pci
+
+VNVME_CFS="/sys/kernel/config/vnvme"
+
+requires() {
+	_nvme_requires
+	_have_fio
+	if [[ ! -d "$VNVME_CFS" ]]; then
+		SKIP_REASONS+=("vnvme emulator not loaded (no ${VNVME_CFS})")
+		return 1
+	fi
+}
+
+device_requires() {
+	_require_test_dev_is_nvme_pci
+	# Only the vnvme-backed controller honours the configfs hotremove/hotplug
+	# knobs; a real NVMe device would ignore them.
+	if [[ ! "$(readlink -f "${TEST_DEV_SYSFS}/device")" =~ /vnvme/ ]]; then
+		SKIP_REASONS+=("$TEST_DEV is not backed by the vnvme emulator")
+		return 1
+	fi
+}
+
+# Time-based write workload so I/O keeps flowing across the whole remove window.
+_vnvme_fio() {
+	fio --name=vnvme-write \
+	    --filename="${TEST_DEV}" \
+	    --ioengine=libaio --direct=1 \
+	    --rw=write --bs=4k --iodepth=32 --numjobs=8 \
+	    --time_based --runtime=30 \
+	    --group_reporting
+}
+
+test_device() {
+	echo "Running ${TEST_NAME}"
+
+	local fio_pid i rc=0
+
+	# On interrupt, try to bring the device back so we don't leave the system
+	# without TEST_DEV.
+	trap 'echo 1 > "${VNVME_CFS}/hotplug" 2>/dev/null; exit 1' INT TERM
+
+	# 1. Background write workload; let it ramp so I/O is genuinely in flight.
+	_vnvme_fio >> "$FULL" 2>&1 &
+	fio_pid=$!
+	sleep 30
+
+	# 2. Surprise-remove while I/O is in flight.
+	echo "hotremove under I/O" >> "$FULL"
+	echo 1 > "${VNVME_CFS}/hotremove"
+
+	# Device must go away.
+	for ((i = 0; i < 100; i++)); do
+		[[ -b ${TEST_DEV} ]] || break
+		sleep .1
+	done
+	if [[ -b ${TEST_DEV} ]]; then
+		echo "Test failed: ${TEST_DEV} still present after hotremove"
+		rc=1
+	fi
+
+	# Stop the (now-doomed) workload.
+	{ kill "$fio_pid"; wait; } &> /dev/null
+
+	# 3. Plug it back in and require re-enumeration.
+	echo 1 > "${VNVME_CFS}/hotplug"
+	for ((i = 0; i < 100; i++)); do
+		[[ -b ${TEST_DEV} ]] && break
+		sleep .1
+	done
+	udevadm settle
+	if [[ ! -b ${TEST_DEV} ]]; then
+		echo "Test failed: ${TEST_DEV} did not return after hotplug"
+		rc=1
+	fi
+
+	trap - INT TERM
+
+	if [[ $rc -eq 0 ]]; then
+		echo "Test complete"
+	fi
+	return $rc
+}
